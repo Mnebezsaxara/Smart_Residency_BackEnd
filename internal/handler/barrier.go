@@ -51,7 +51,7 @@ func (h *BarrierHandler) List(c *gin.Context) {
 	}
 	var err error
 
-	if role == "admin" {
+	if role == "admin" || role == "guard" {
 		rows, err = h.db.Query(ctx,
 			`SELECT id, user_id, access_type, direction, car_number, notes, created_at
 			 FROM barrier_logs ORDER BY created_at DESC LIMIT 200`)

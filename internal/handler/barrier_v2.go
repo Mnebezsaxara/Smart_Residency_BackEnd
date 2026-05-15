@@ -293,8 +293,9 @@ func (h *BarrierV2Handler) ScanQR(c *gin.Context) {
 }
 
 func (h *BarrierV2Handler) OpenManual(c *gin.Context) {
-	if c.GetString("user_role") != "admin" {
-		forbiddenAccess(c, "admin only")
+	role := c.GetString("user_role")
+	if role != "admin" && role != "guard" {
+		forbiddenAccess(c, "admin or guard only")
 		return
 	}
 	var req struct {
@@ -345,7 +346,7 @@ func (h *BarrierV2Handler) ListEvents(c *gin.Context) {
 	var query string
 	var args []any
 
-	if role == "admin" {
+	if role == "admin" || role == "guard" {
 		query = `SELECT id, event_type, direction, plate_number, vehicle_id, guest_pass_id, opened_by, status, created_at
 		         FROM barrier_events
 		         ORDER BY created_at DESC LIMIT 100`

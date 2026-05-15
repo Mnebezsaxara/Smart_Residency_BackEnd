@@ -19,8 +19,9 @@ func NewAdminBarrierHandler(db *pgxpool.Pool, barrierV2 *BarrierV2Handler) *Admi
 }
 
 func (h *AdminBarrierHandler) requireAdmin(c *gin.Context) bool {
-	if c.GetString("user_role") != "admin" {
-		forbiddenAccess(c, "admin only")
+	role := c.GetString("user_role")
+	if role != "admin" && role != "guard" {
+		forbiddenAccess(c, "admin or guard only")
 		return false
 	}
 	return true
