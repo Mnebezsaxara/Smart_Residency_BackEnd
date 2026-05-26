@@ -91,14 +91,26 @@ func (s *Sender) NotifyEvent(ctx context.Context, eventID string) (int, error) {
 	sentAdmins, _ := s.SendToAdmins(ctx, data)
 
 	// Save bell notification for admins
-	notifData := fmt.Sprintf(`{"event_id":"%s","entrance_num":%d,"floor":%d,"type":"%s","status":"%s"}`,
-		eventID, entrance, floor, typ, status)
+	notifData := fmt.Sprintf(`{"event_id":"%s","entrance_num":%d,"floor":%d,"type":"%s","status":"%s","threat_type":"%s"}`,
+		eventID, entrance, floor, typ, status, threatStr)
 	if _, dbErr := s.db.Exec(ctx, `
 		INSERT INTO notifications (target_role, kind, title, body, data)
 		VALUES ('admin', 'sensor_alert', $1, $2, $3)`,
 		title, body, notifData,
 	); dbErr != nil {
 		log.Printf("[fcm] sensor_alert bell insert: %v", dbErr)
+	}
+
+	// Save bell notification for every approved resident of the same entrance.
+	// Same addressing criteria as the FCM multicast above.
+	if _, dbErr := s.db.Exec(ctx, `
+		INSERT INTO notifications (target_user_id, kind, title, body, data)
+		SELECT p.id, 'sensor_alert', $1, $2, $3::jsonb
+		FROM profiles p
+		WHERE p.entrance = $4 AND p.verification_status = 'approved'`,
+		title, body, notifData, entrance,
+	); dbErr != nil {
+		log.Printf("[fcm] sensor_alert resident bell insert: %v", dbErr)
 	}
 
 	return sentResidents + sentAdmins, nil
