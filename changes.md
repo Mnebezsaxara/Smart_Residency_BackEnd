@@ -294,3 +294,79 @@ go run cmd/server/main.go
 - [ ] Сценарий «гость законно приехал»: создать пропуск, отсканировать QR → статус `arrived`. После этого инжект `Guest spot occupied` G-01 — алерт НЕ приходит (логика уже была корректна).
 - [ ] Сценарий «владелец на своём месте»: инжект `Manual IN A777BC` через barrier-flow с `gate_id=parking-gate`, затем `Permanent spot occupied` P-01 (закреплён за владельцем `A777BC`) → push НЕ приходит.
 - [ ] Сценарий «чужак на permanent»: только `Permanent spot occupied` P-01 без предварительного barrier-event → push приходит владельцу с `kind=parking_alert`.
+
+---
+
+## 8. Фиксы 4 и 5 — управление сотрудниками (по запросу Flutter-Claude)
+
+Flutter добавил кнопку «+» на админ-странице «Сотрудники» и динамизировал «Сервисы» у резидента. Бэкенду нужны два эндпоинта и одна миграция.
+
+### 8.1. Миграция `014_staff_profile_fields.sql`
+
+Добавляет в `profiles` две колонки:
+- `work_schedule VARCHAR(255) DEFAULT ''` — режим работы сотрудника.
+- `description TEXT DEFAULT ''` — описание сотрудника, показывается резиденту.
+
+Существующие профили получат пустые строки, ничего не ломается.
+
+### 8.2. POST `/api/v1/admin/staff` — создание сотрудника
+
+Только для роли `admin`. Контракт запроса (полностью совпадает с `_CreateStaffPage` Flutter):
+
+```json
+{
+  "full_name": "Иван Тестов",
+  "email": "test@test.com",
+  "password": "123456",
+  "phone": "+7 707 111 22 33",
+  "specialty": "plumbing",
+  "work_schedule": "Пн–Пт, 09:00–18:00",
+  "description": "..."
+}
+```
+
+Валидация:
+- `email` — формат email.
+- `password` — минимум 6 символов.
+- `specialty` — одно из `plumbing | electrical | cleaning | garbage | intercom | elevator`.
+
+Что делает:
+1. Хэширует пароль через `bcrypt` (так же как `Auth.Register`).
+2. В транзакции: `INSERT INTO users (...)` + `INSERT INTO profiles (... role='staff', verification_status='approved', ...)`.
+3. На дубликат email → `409 {"error":"email already registered"}`.
+4. Возвращает `201` с телом в формате `publicStaffMember` (id, full_name, email, phone, specialty, work_schedule, description, is_available=true).
+
+После этого сотрудник может логиниться через обычный `POST /auth/login` — `Auth.Login` отдаст ему JWT с `role='staff'`.
+
+### 8.3. GET `/api/v1/staff` — публичный список сотрудников
+
+Доступен любому авторизованному пользователю. Используется на странице «Сервисы» у резидента.
+
+Ответ — массив `publicStaffMember`:
+
+```json
+[
+  {
+    "id": "uuid",
+    "full_name": "Иван Тестов",
+    "email": "test@test.com",
+    "phone": "+7 707 111 22 33",
+    "specialty": "plumbing",
+    "work_schedule": "Пн–Пт, 09:00–18:00",
+    "description": "...",
+    "is_available": true
+  }
+]
+```
+
+`is_available` — вычисляется как «нет ни одной `service_requests.status = 'in_progress'`, назначенной на этого сотрудника». Если на сотруднике висит активная заявка — `false`.
+
+### 8.4. Чек-лист для Flutter-Claude и Мансура
+
+- [ ] Запустить бэк → в логах `[db] migration applied: 014_staff_profile_fields.sql`.
+- [ ] Залогиниться админом → открыть «Сотрудники» → нажать `+` → заполнить форму → 201, в списке появляется новая строка.
+- [ ] Тот же email повторно → 409 «email already registered».
+- [ ] Specialty `foo` → 400 «unsupported specialty».
+- [ ] Logout → login с email/паролем созданного сотрудника → JWT с `role='staff'`.
+- [ ] Резидент открывает «Сервисы» → видит карточку с этой специальностью, заполнены ФИО / телефон / расписание / описание.
+- [ ] Админ назначает заявку этому сотруднику (`status='in_progress'`) → у резидента в «Сервисах» `is_available=false` (карточка становится «занят»).

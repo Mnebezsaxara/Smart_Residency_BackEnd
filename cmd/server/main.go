@@ -151,7 +151,9 @@ func main() {
 
 		staffH := handler.NewStaffHandler(pool)
 		priv.GET("/admin/staff", staffH.List)
+		priv.POST("/admin/staff", staffH.Create)
 		priv.GET("/admin/staff/:id/requests", staffH.Requests)
+		priv.GET("/staff", staffH.PublicList)
 
 		guestH := handler.NewGuestHandler(pool)
 		priv.GET("/guest-access", guestH.List)

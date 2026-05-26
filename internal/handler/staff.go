@@ -3,16 +3,29 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type StaffHandler struct{ db *pgxpool.Pool }
 
 func NewStaffHandler(db *pgxpool.Pool) *StaffHandler {
 	return &StaffHandler{db: db}
+}
+
+// allowedSpecialties mirrors the values Flutter sends from admin_staff_page.dart.
+var allowedSpecialties = map[string]bool{
+	"plumbing":   true,
+	"electrical": true,
+	"cleaning":   true,
+	"garbage":    true,
+	"intercom":   true,
+	"elevator":   true,
 }
 
 type staffMember struct {
@@ -24,6 +37,149 @@ type staffMember struct {
 	InProgress  int    `json:"in_progress_count"`
 	DoneToday   int    `json:"done_today_count"`
 	LastTakenAt *time.Time `json:"last_taken_at,omitempty"`
+}
+
+// publicStaffMember is the shape returned by GET /staff (visible to any
+// authenticated user, used by the resident "Services" page).
+type publicStaffMember struct {
+	ID            string `json:"id"`
+	FullName      string `json:"full_name"`
+	Email         string `json:"email"`
+	Phone         string `json:"phone"`
+	Specialty     string `json:"specialty"`
+	WorkSchedule  string `json:"work_schedule"`
+	Description   string `json:"description"`
+	IsAvailable   bool   `json:"is_available"`
+}
+
+// POST /admin/staff — create a new staff account (admin only).
+type createStaffReq struct {
+	FullName     string `json:"full_name"     binding:"required"`
+	Email        string `json:"email"         binding:"required,email"`
+	Password     string `json:"password"      binding:"required,min=6"`
+	Phone        string `json:"phone"         binding:"required"`
+	Specialty    string `json:"specialty"     binding:"required"`
+	WorkSchedule string `json:"work_schedule" binding:"required"`
+	Description  string `json:"description"`
+}
+
+func (h *StaffHandler) Create(c *gin.Context) {
+	if c.GetString("user_role") != "admin" {
+		forbiddenAccess(c, "admin only")
+		return
+	}
+
+	var req createStaffReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	specialty := strings.ToLower(strings.TrimSpace(req.Specialty))
+	if !allowedSpecialties[specialty] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported specialty"})
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		internalError(c, "Staff.Create/bcrypt", err)
+		return
+	}
+
+	ctx := context.Background()
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		internalError(c, "Staff.Create/begin", err)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	userID := uuid.New().String()
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)`,
+		userID, email, string(hash),
+	); err != nil {
+		if strings.Contains(err.Error(), "23505") || strings.Contains(err.Error(), "duplicate") {
+			c.JSON(http.StatusConflict, gin.H{"error": "email already registered"})
+			return
+		}
+		internalError(c, "Staff.Create/users", err)
+		return
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO profiles (
+			id, full_name, email, phone,
+			role, specialty, work_schedule, description,
+			verification_status
+		) VALUES ($1, $2, $3, $4, 'staff', $5, $6, $7, 'approved')`,
+		userID, req.FullName, email, req.Phone,
+		specialty, req.WorkSchedule, req.Description,
+	); err != nil {
+		internalError(c, "Staff.Create/profiles", err)
+		return
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		internalError(c, "Staff.Create/commit", err)
+		return
+	}
+
+	c.JSON(http.StatusCreated, publicStaffMember{
+		ID:           userID,
+		FullName:     req.FullName,
+		Email:        email,
+		Phone:        req.Phone,
+		Specialty:    specialty,
+		WorkSchedule: req.WorkSchedule,
+		Description:  req.Description,
+		IsAvailable:  true,
+	})
+}
+
+// GET /staff — public list visible to any authenticated user.
+// Drives the resident "Services" page.
+func (h *StaffHandler) PublicList(c *gin.Context) {
+	rows, err := h.db.Query(context.Background(), `
+		SELECT
+			p.id,
+			p.full_name,
+			p.email,
+			p.phone,
+			COALESCE(p.specialty, ''),
+			COALESCE(p.work_schedule, ''),
+			COALESCE(p.description, ''),
+			COUNT(sr.id) FILTER (WHERE sr.status = 'in_progress') AS in_progress
+		FROM profiles p
+		LEFT JOIN service_requests sr ON sr.assigned_to = p.id
+		WHERE p.role = 'staff'
+		GROUP BY p.id
+		ORDER BY p.full_name`)
+	if err != nil {
+		internalError(c, "Staff.PublicList/query", err)
+		return
+	}
+	defer rows.Close()
+
+	out := []publicStaffMember{}
+	for rows.Next() {
+		var m publicStaffMember
+		var inProgress int
+		if err := rows.Scan(
+			&m.ID, &m.FullName, &m.Email, &m.Phone,
+			&m.Specialty, &m.WorkSchedule, &m.Description,
+			&inProgress,
+		); err != nil {
+			internalError(c, "Staff.PublicList/scan", err)
+			return
+		}
+		m.IsAvailable = inProgress == 0
+		out = append(out, m)
+	}
+	c.JSON(http.StatusOK, out)
 }
 
 // GET /admin/staff — list all staff members with their current workload.
