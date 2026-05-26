@@ -17,10 +17,11 @@ type profileRow struct {
 	Entrance           *int      `json:"entrance"`
 	Floor              *int      `json:"floor"`
 	Apartment          string    `json:"apartment"`
-	Role               string    `json:"role"`
-	VerificationStatus string    `json:"verification_status"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	Role                string    `json:"role"`
+	VerificationStatus  string    `json:"verification_status"`
+	ParkingPermitStatus string    `json:"parking_permit_status"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 func (p *profileRow) scanFrom(s interface{ Scan(...any) error }) error {
@@ -28,7 +29,7 @@ func (p *profileRow) scanFrom(s interface{ Scan(...any) error }) error {
 		&p.ID, &p.FullName, &p.Email, &p.Phone, &p.IIN, &p.PersonType,
 		&p.City, &p.Street, &p.PropertyType, &p.PropertyNumber, &p.FullAddress,
 		&p.Entrance, &p.Floor, &p.Apartment,
-		&p.Role, &p.VerificationStatus, &p.CreatedAt, &p.UpdatedAt,
+		&p.Role, &p.VerificationStatus, &p.ParkingPermitStatus, &p.CreatedAt, &p.UpdatedAt,
 	)
 }
 
@@ -36,4 +37,4 @@ const profileCols = `
 	id, full_name, email, phone, iin, person_type,
 	city, street, property_type, property_number, full_address,
 	entrance, floor, apartment,
-	role, verification_status, created_at, updated_at`
+	role, verification_status, COALESCE(parking_permit_status, ''), created_at, updated_at`

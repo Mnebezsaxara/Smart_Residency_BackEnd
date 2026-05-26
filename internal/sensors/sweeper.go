@@ -73,8 +73,8 @@ func (s *OfflineSweeper) sweepOnce(ctx context.Context) {
 	defer rows.Close()
 
 	type offline struct {
-		id, typ       string
-		entrance, fl  int
+		id, typ      string
+		entrance, fl int
 	}
 	var batch []offline
 	for rows.Next() {

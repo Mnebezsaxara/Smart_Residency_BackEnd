@@ -82,7 +82,26 @@ func (s *Sender) NotifyEvent(ctx context.Context, eventID string) (int, error) {
 		"body":         body,
 	}
 
-	return s.sendMulticast(ctx, tokens, data)
+	sentResidents, err := s.sendMulticast(ctx, tokens, data)
+	if err != nil {
+		return sentResidents, err
+	}
+
+	// Notify admins via FCM
+	sentAdmins, _ := s.SendToAdmins(ctx, data)
+
+	// Save bell notification for admins
+	notifData := fmt.Sprintf(`{"event_id":"%s","entrance_num":%d,"floor":%d,"type":"%s","status":"%s"}`,
+		eventID, entrance, floor, typ, status)
+	if _, dbErr := s.db.Exec(ctx, `
+		INSERT INTO notifications (target_role, kind, title, body, data)
+		VALUES ('admin', 'sensor_alert', $1, $2, $3)`,
+		title, body, notifData,
+	); dbErr != nil {
+		log.Printf("[fcm] sensor_alert bell insert: %v", dbErr)
+	}
+
+	return sentResidents + sentAdmins, nil
 }
 
 func (s *Sender) sendMulticast(ctx context.Context, tokens []string, data map[string]string) (int, error) {
@@ -163,9 +182,9 @@ func channelIDFor(kind string) string {
 	switch kind {
 	case "unknown_vehicle", "guest_arrived":
 		return "barrier_events_v2"
-	case "parking_alert", "parking_spot_freed":
+	case "parking_alert", "parking_spot_freed", "parking_no_permit":
 		return "parking_events_v2"
-	case "sensor_alert":
+	case "sensor_alert", "sensor_offline":
 		return "sensor_alerts_v2"
 	default:
 		return "smart_residency_events"
@@ -175,20 +194,35 @@ func channelIDFor(kind string) string {
 // NotifyOffline alerts every approved admin that a sensor stopped responding.
 // Used by the OFFLINE sweeper goroutine.
 func (s *Sender) NotifyOffline(ctx context.Context, sensorID, sensorType string, entrance, floor int) (int, error) {
-	kind := "Водяной датчик"
+	kindLabel := "Водяной датчик"
 	if sensorType == "SMOKE" {
-		kind = "Датчик дыма"
+		kindLabel = "Датчик дыма"
 	}
+	title := "Датчик не на связи"
+	body := fmt.Sprintf("%s %d/%d не отвечает >60 сек", kindLabel, entrance, floor)
 	data := map[string]string{
 		"kind":         "sensor_offline",
 		"sensor_id":    sensorID,
 		"sensor_type":  sensorType,
 		"entrance_num": fmt.Sprintf("%d", entrance),
 		"floor":        fmt.Sprintf("%d", floor),
-		"title":        "Датчик не на связи",
-		"body":         fmt.Sprintf("%s %d/%d не отвечает >60 сек", kind, entrance, floor),
+		"title":        title,
+		"body":         body,
 	}
-	return s.SendToAdmins(ctx, data)
+	sent, err := s.SendToAdmins(ctx, data)
+
+	// Save bell notification for admins
+	notifData := fmt.Sprintf(`{"sensor_id":"%s","sensor_type":"%s","entrance_num":%d,"floor":%d}`,
+		sensorID, sensorType, entrance, floor)
+	if _, dbErr := s.db.Exec(ctx, `
+		INSERT INTO notifications (target_role, kind, title, body, data)
+		VALUES ('admin', 'sensor_offline', $1, $2, $3)`,
+		title, body, notifData,
+	); dbErr != nil {
+		log.Printf("[fcm] sensor_offline bell insert: %v", dbErr)
+	}
+
+	return sent, err
 }
 
 func (s *Sender) SendToAdmins(ctx context.Context, data map[string]string) (int, error) {

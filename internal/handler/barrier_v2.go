@@ -77,21 +77,33 @@ func (h *BarrierV2Handler) ProcessScanPlate(ctx context.Context, plateNumber, di
 	}
 
 	var guestPassID, guestName, residentID string
-	var guestPhone *string
+	var guestPhone, guestSpotID *string
 	err = tx.QueryRow(ctx, `
-		SELECT id, guest_name, guest_phone, resident_id
+		SELECT id, guest_name, guest_phone, resident_id, parking_spot_id
 		FROM guest_access
 		WHERE UPPER(TRIM(car_number)) = $1 AND status = 'active' AND valid_until > NOW()`, plate,
-	).Scan(&guestPassID, &guestName, &guestPhone, &residentID)
+	).Scan(&guestPassID, &guestName, &guestPhone, &residentID, &guestSpotID)
 	if err == nil {
+		// Car guest with reserved parking spot → only territory entry (first of two scans).
+		// Car guest without spot → single scan, mark used immediately.
+		hasParking := guestSpotID != nil
+		newStatus := "used"
+		notifTitle := "Ваш гость въехал"
+		notifBody := "Гость " + guestName + " прибыл на территорию ЖК"
+		if hasParking {
+			newStatus = "arrived"
+			notifTitle = "Ваш гость на территории"
+			notifBody = "Гость " + guestName + " заехал на территорию ЖК"
+		}
+
 		h.openBarrier(direction)
-		if _, err = tx.Exec(ctx, `UPDATE guest_access SET status = 'used' WHERE id = $1`, guestPassID); err != nil {
+		if _, err = tx.Exec(ctx, `UPDATE guest_access SET status = $2 WHERE id = $1`, guestPassID, newStatus); err != nil {
 			_ = tx.Rollback(ctx)
 			return "", "", err
 		}
 		err = tx.QueryRow(ctx, `
 			INSERT INTO barrier_events (event_type, direction, plate_number, guest_pass_id, status, gate_id)
-			VALUES ('QR_SCAN', $1, $2, $3, 'OPENED', $4)
+			VALUES ('PLATE_SCAN_TERRITORY', $1, $2, $3, 'OPENED', $4)
 			RETURNING id`, direction, plate, guestPassID, gateID,
 		).Scan(&eventID)
 		if err != nil {
@@ -101,24 +113,33 @@ func (h *BarrierV2Handler) ProcessScanPlate(ctx context.Context, plateNumber, di
 		if err = tx.Commit(ctx); err != nil {
 			return "", "", err
 		}
-		if h.notifier != nil {
-			go func(evtID, rID, gName, dir string) {
+		go func(evtID, rID, gName, dir, title, body string) {
+			bgCtx := context.Background()
+			jsonData := fmt.Sprintf(`{"event_id":"%s","guest_name":"%s","direction":"%s"}`, evtID, gName, dir)
+			if _, dbErr := h.db.Exec(bgCtx, `
+				INSERT INTO notifications (target_user_id, kind, title, body, data)
+				VALUES ($1, 'guest_arrived', $2, $3, $4)`,
+				rID, title, body, jsonData,
+			); dbErr != nil {
+				log.Printf("[barrier] guest bell: %v", dbErr)
+			}
+			if h.notifier != nil {
 				data := map[string]string{
 					"event_id":   evtID,
 					"kind":       "guest_arrived",
 					"guest_name": gName,
 					"direction":  dir,
-					"title":      "Ваш гость въехал",
-					"body":       "Гость " + gName + " прибыл на территорию ЖК",
+					"title":      title,
+					"body":       body,
 				}
-				sent, err := h.notifier.SendToUser(context.Background(), rID, data)
+				sent, err := h.notifier.SendToUser(bgCtx, rID, data)
 				if err != nil {
 					log.Printf("[barrier] guest arrived fcm: %v", err)
 				} else {
 					log.Printf("[barrier] guest arrived fcm: resident=%s sent=%d guest=%s", rID, sent, gName)
 				}
-			}(eventID, residentID, guestName, direction)
-		}
+			}
+		}(eventID, residentID, guestName, direction, notifTitle, notifBody)
 		return "OPEN", eventID, nil
 	}
 	_ = tx.Rollback(ctx)
@@ -211,13 +232,13 @@ func (h *BarrierV2Handler) ScanQR(c *gin.Context) {
 
 	ctx := context.Background()
 
-	var id, guestName, residentID, status string
-	var guestPhone *string
+	var id, guestName, residentID, status, accessType string
+	var guestPhone, parkingSpotID *string
 	var validUntil time.Time
 	err := h.db.QueryRow(ctx, `
-		SELECT id, guest_name, guest_phone, resident_id, status, valid_until
+		SELECT id, guest_name, guest_phone, resident_id, status, valid_until, access_type, parking_spot_id
 		FROM guest_access WHERE qr_code = $1`, req.QRCode,
-	).Scan(&id, &guestName, &guestPhone, &residentID, &status, &validUntil)
+	).Scan(&id, &guestName, &guestPhone, &residentID, &status, &validUntil, &accessType, &parkingSpotID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "QR_NOT_FOUND"})
@@ -226,7 +247,7 @@ func (h *BarrierV2Handler) ScanQR(c *gin.Context) {
 		internalError(c, "BarrierV2.ScanQR/query", err)
 		return
 	}
-	if status != "active" {
+	if status != "active" && status != "arrived" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "QR_ALREADY_USED"})
 		return
 	}
@@ -235,21 +256,51 @@ func (h *BarrierV2Handler) ScanQR(c *gin.Context) {
 		return
 	}
 
+	// Определяем: первое сканирование (территория) или второе (паркинг)
+	isCarGuest := accessType == "car"
+	isFirstScan := status == "active"
+
+	var newStatus, eventType, notifTitle, notifBody string
+	if isCarGuest && isFirstScan {
+		newStatus = "arrived"
+		eventType = "QR_SCAN_TERRITORY"
+		notifTitle = "Ваш гость на территории"
+		notifBody = "Гость " + guestName + " заехал на территорию ЖК"
+	} else if isCarGuest {
+		newStatus = "used"
+		eventType = "QR_SCAN_PARKING"
+		notifTitle = "Ваш гость в паркинге"
+		notifBody = "Гость " + guestName + " припарковался в паркинге"
+	} else {
+		newStatus = "used"
+		eventType = "QR_SCAN_TERRITORY"
+		notifTitle = "Ваш гость прибыл"
+		notifBody = "Гость " + guestName + " прибыл на территорию ЖК"
+	}
+
 	tx, err := h.db.Begin(ctx)
 	if err != nil {
 		internalError(c, "BarrierV2.ScanQR/begin", err)
 		return
 	}
-	if _, err = tx.Exec(ctx, `UPDATE guest_access SET status = 'used' WHERE id = $1`, id); err != nil {
+	if _, err = tx.Exec(ctx, `UPDATE guest_access SET status = $2 WHERE id = $1`, id, newStatus); err != nil {
 		_ = tx.Rollback(ctx)
 		internalError(c, "BarrierV2.ScanQR/update", err)
 		return
 	}
+	// When guest parks (second scan) — mark the spot as occupied.
+	if newStatus == "used" && parkingSpotID != nil {
+		if _, err = tx.Exec(ctx, `UPDATE parking_spots SET status = 'occupied' WHERE id = $1`, *parkingSpotID); err != nil {
+			_ = tx.Rollback(ctx)
+			internalError(c, "BarrierV2.ScanQR/spotUpdate", err)
+			return
+		}
+	}
 	var eventID string
 	if err = tx.QueryRow(ctx, `
 		INSERT INTO barrier_events (event_type, direction, guest_pass_id, status)
-		VALUES ('QR_SCAN', $1, $2, 'OPENED')
-		RETURNING id`, req.Direction, id,
+		VALUES ($1, $2, $3, 'OPENED')
+		RETURNING id`, eventType, req.Direction, id,
 	).Scan(&eventID); err != nil {
 		_ = tx.Rollback(ctx)
 		internalError(c, "BarrierV2.ScanQR/insert", err)
@@ -262,24 +313,34 @@ func (h *BarrierV2Handler) ScanQR(c *gin.Context) {
 
 	h.openBarrier(req.Direction)
 
-	if h.notifier != nil {
-		go func(evtID, rID, gName, dir string) {
-			data := map[string]string{
+	go func(evtID, rID, gName, dir, title, body string) {
+		bgCtx := context.Background()
+		jsonData := fmt.Sprintf(`{"event_id":"%s","guest_name":"%s","direction":"%s"}`, evtID, gName, dir)
+
+		if _, dbErr := h.db.Exec(bgCtx, `
+			INSERT INTO notifications (target_user_id, kind, title, body, data)
+			VALUES ($1, 'guest_arrived', $2, $3, $4)`,
+			rID, title, body, jsonData,
+		); dbErr != nil {
+			log.Printf("[barrier] guest bell: %v", dbErr)
+		}
+
+		if h.notifier != nil {
+			sent, err := h.notifier.SendToUser(bgCtx, rID, map[string]string{
 				"event_id":   evtID,
 				"kind":       "guest_arrived",
 				"guest_name": gName,
 				"direction":  dir,
-				"title":      "Ваш гость въехал",
-				"body":       "Гость " + gName + " прибыл на территорию ЖК",
-			}
-			sent, err := h.notifier.SendToUser(context.Background(), rID, data)
+				"title":      title,
+				"body":       body,
+			})
 			if err != nil {
-				log.Printf("[barrier] guest arrived fcm: %v", err)
+				log.Printf("[barrier] guest fcm: %v", err)
 			} else {
-				log.Printf("[barrier] guest arrived fcm: resident=%s sent=%d guest=%s", rID, sent, gName)
+				log.Printf("[barrier] guest fcm: resident=%s sent=%d guest=%s", rID, sent, gName)
 			}
-		}(eventID, residentID, guestName, req.Direction)
-	}
+		}
+	}(eventID, residentID, guestName, req.Direction, notifTitle, notifBody)
 
 	phoneStr := ""
 	if guestPhone != nil {

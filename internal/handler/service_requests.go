@@ -330,6 +330,71 @@ func (h *ServiceRequestHandler) staffSpecialty(ctx context.Context, userID strin
 	return s, err
 }
 
+// ResolveAppeal — admin resolves a parking appeal service request.
+// POST /admin/service-requests/:id/resolve-appeal
+func (h *ServiceRequestHandler) ResolveAppeal(c *gin.Context) {
+	if c.GetString("user_role") != "admin" {
+		forbiddenAccess(c, "admin only")
+		return
+	}
+	id := c.Param("id")
+	var body struct {
+		Approved bool `json:"approved"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := context.Background()
+
+	var userID string
+	if err := h.db.QueryRow(ctx,
+		`SELECT user_id FROM service_requests WHERE id=$1`, id,
+	).Scan(&userID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "request not found"})
+		return
+	}
+
+	if body.Approved {
+		var permitID string
+		if err := h.db.QueryRow(ctx,
+			`SELECT id FROM parking_permits
+			 WHERE user_id=$1 AND status='rejected'
+			 ORDER BY created_at DESC LIMIT 1`, userID,
+		).Scan(&permitID); err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "no rejected permit found for user"})
+			return
+		}
+		if _, err := h.db.Exec(ctx,
+			`UPDATE parking_permits SET status='approved', updated_at=NOW() WHERE id=$1`, permitID,
+		); err != nil {
+			internalError(c, "SR.ResolveAppeal/approve_permit", err)
+			return
+		}
+		if _, err := h.db.Exec(ctx,
+			`UPDATE profiles SET parking_permit_status='approved', updated_at=NOW() WHERE id=$1`, userID,
+		); err != nil {
+			internalError(c, "SR.ResolveAppeal/update_profile", err)
+			return
+		}
+		if _, err := h.db.Exec(ctx,
+			`UPDATE service_requests SET status='done', updated_at=NOW() WHERE id=$1`, id,
+		); err != nil {
+			internalError(c, "SR.ResolveAppeal/mark_done", err)
+			return
+		}
+	} else {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE service_requests SET status='rejected', updated_at=NOW() WHERE id=$1`, id,
+		); err != nil {
+			internalError(c, "SR.ResolveAppeal/reject", err)
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"resolved": true, "approved": body.Approved})
+}
+
 func (h *ServiceRequestHandler) attachPhotos(ctx context.Context, requests []serviceRequest) {
 	if len(requests) == 0 {
 		return

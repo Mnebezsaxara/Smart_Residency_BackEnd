@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"log"
 	"strings"
 
@@ -21,6 +22,7 @@ type Broadcaster interface {
 
 type ParkingNotifier interface {
 	SendToUser(ctx context.Context, userID string, data map[string]string) (int, error)
+	SendToAdmins(ctx context.Context, data map[string]string) (int, error)
 }
 
 type Config struct {
@@ -31,12 +33,13 @@ type Config struct {
 }
 
 type Subscriber struct {
-	db              *pgxpool.Pool
-	notifier        Notifier
-	bcast           Broadcaster
-	parkingNotifier ParkingNotifier
-	client          paho.Client
-	barrierCallback func(ctx context.Context, plate, direction, gateID string) (string, string, error)
+	db                  *pgxpool.Pool
+	notifier            Notifier
+	bcast               Broadcaster
+	parkingNotifier     ParkingNotifier
+	client              paho.Client
+	barrierCallback     func(ctx context.Context, plate, direction, gateID string) (string, string, error)
+	parkingGateCallback func(ctx context.Context, plate, direction, gateID string) (string, string, error)
 }
 
 func New(cfg Config, db *pgxpool.Pool, notifier Notifier, bcast Broadcaster) (*Subscriber, error) {
@@ -259,17 +262,58 @@ func (s *Subscriber) handleBarrier(_ paho.Client, m paho.Message) {
 			msg.GateID, msg.Confidence)
 		return
 	}
+	if msg.GateID == "parking-gate" {
+		if s.parkingGateCallback != nil {
+			go func() {
+				action, eventID, err := s.parkingGateCallback(context.Background(), msg.PlateNumber, msg.Direction, msg.GateID)
+				if err != nil {
+					log.Printf("[mqtt] parking gate callback: %v", err)
+					return
+				}
+				logGateDecision("parking-gate", msg.PlateNumber, msg.Direction, action, eventID)
+			}()
+		}
+		return
+	}
 	if s.barrierCallback != nil {
 		go func() {
-			if _, _, err := s.barrierCallback(context.Background(), msg.PlateNumber, msg.Direction, msg.GateID); err != nil {
-				log.Printf("[mqtt] barrier callback: %v", err)
+			gateID := msg.GateID
+			if gateID == "" {
+				gateID = "main-gate"
 			}
+			action, eventID, err := s.barrierCallback(context.Background(), msg.PlateNumber, msg.Direction, gateID)
+			if err != nil {
+				log.Printf("[mqtt] barrier callback: %v", err)
+				return
+			}
+			logGateDecision(gateID, msg.PlateNumber, msg.Direction, action, eventID)
 		}()
+	}
+}
+
+func logGateDecision(gateID, plate, direction, action, eventID string) {
+	if direction == "" {
+		direction = "IN"
+	}
+	switch action {
+	case "OPEN":
+		log.Printf("[mqtt] gate decision: gate=%s plate=%s direction=%s access=GRANTED event_id=%s",
+			gateID, plate, direction, eventID)
+	case "REJECT":
+		log.Printf("[mqtt] gate decision: gate=%s plate=%s direction=%s access=DENIED event_id=%s",
+			gateID, plate, direction, eventID)
+	default:
+		log.Printf("[mqtt] gate decision: gate=%s plate=%s direction=%s action=%s event_id=%s",
+			gateID, plate, direction, action, eventID)
 	}
 }
 
 func (s *Subscriber) SetBarrierCallback(f func(ctx context.Context, plate, direction, gateID string) (string, string, error)) {
 	s.barrierCallback = f
+}
+
+func (s *Subscriber) SetParkingGateCallback(f func(ctx context.Context, plate, direction, gateID string) (string, string, error)) {
+	s.parkingGateCallback = f
 }
 
 type motionMsg struct {
@@ -332,10 +376,30 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 		return
 	}
 
+	// Для гостевых мест заранее ищем активный пропуск — он влияет на newStatus
+	var guestPassID, guestResidentID, guestCarNumber string
+	hasActiveGuestPass := false
+	if spotType == "guest" {
+		err2 := s.db.QueryRow(ctx, `
+			SELECT id, resident_id, COALESCE(car_number, '')
+			FROM guest_access
+			WHERE parking_spot_id = $1
+			  AND status IN ('active', 'arrived')
+			  AND valid_from <= NOW()
+			  AND valid_until >= NOW()
+			LIMIT 1
+		`, spotID).Scan(&guestPassID, &guestResidentID, &guestCarNumber)
+		hasActiveGuestPass = (err2 == nil)
+	}
+
+	// Если гостевое место освобождается, но пропуск ещё активен — оставляем reserved
 	newStatus := "free"
 	if msg.EventType == "occupied" {
 		newStatus = "occupied"
+	} else if msg.EventType == "freed" && spotType == "guest" && hasActiveGuestPass {
+		newStatus = "reserved"
 	}
+
 	if _, err := s.db.Exec(ctx,
 		`UPDATE parking_spots SET status = $1 WHERE id = $2`, newStatus, spotID); err != nil {
 		log.Printf("[mqtt] parking update spot %s: %v", msg.SpotNumber, err)
@@ -345,68 +409,147 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 		log.Printf("[mqtt] parking insert event: %v", err)
 	}
 
-	if s.parkingNotifier == nil || assignedUserID == nil || spotType != "permanent" {
-		log.Printf(
-			"[mqtt] parking no fcm: spot=%s type=%s assigned=%v notifier=%v",
-			msg.SpotNumber,
-			spotType,
-			assignedUserID != nil,
-			s.parkingNotifier != nil,
-		)
+	if s.parkingNotifier == nil {
 		return
 	}
 
-	uid := *assignedUserID
-	sn := msg.SpotNumber
-	if msg.EventType == "occupied" {
-		var ownerEntries int
-		_ = s.db.QueryRow(ctx, `
-			SELECT COUNT(*)
-			FROM barrier_events be
-			JOIN vehicles v ON v.id = be.vehicle_id
-			WHERE v.user_id    = $1
-			  AND be.direction = 'IN'
-			  AND be.status    = 'OPENED'
-			  AND be.gate_id   = 'parking-gate'
-			  AND be.created_at > NOW() - INTERVAL '30 minutes'
-		`, uid).Scan(&ownerEntries)
+	// ── Постоянные места ─────────────────────────────────────────────────────
+	if spotType == "permanent" && assignedUserID != nil {
+		uid := *assignedUserID
+		sn := msg.SpotNumber
+		if msg.EventType == "occupied" {
+			var ownerEntries int
+			_ = s.db.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM barrier_events be
+				JOIN vehicles v ON v.id = be.vehicle_id
+				WHERE v.user_id    = $1
+				  AND be.direction = 'IN'
+				  AND be.status    = 'OPENED'
+				  AND be.gate_id   = 'parking-gate'
+				  AND be.created_at > NOW() - INTERVAL '30 minutes'
+			`, uid).Scan(&ownerEntries)
 
-		if ownerEntries > 0 {
-			log.Printf("[mqtt] parking spot=%s occupied: owner vehicle entered recently (%d event(s)) — skip fcm",
-				sn, ownerEntries)
-		} else {
+			if ownerEntries > 0 {
+				log.Printf("[mqtt] parking spot=%s occupied: owner vehicle entered recently (%d event(s)) — skip fcm",
+					sn, ownerEntries)
+			} else {
+				go func() {
+					data := map[string]string{
+						"kind":        "parking_alert",
+						"spot_id":     spotID,
+						"spot_number": sn,
+						"title":       "Ваше место занято",
+						"body":        "Место " + sn + " занято посторонним ТС",
+					}
+					sent, err := s.parkingNotifier.SendToUser(context.Background(), uid, data)
+					if err != nil {
+						log.Printf("[mqtt] parking fcm occupied: %v", err)
+					} else {
+						log.Printf("[mqtt] parking fcm occupied: user=%s sent=%d spot=%s", uid, sent, sn)
+					}
+				}()
+			}
+		} else if msg.EventType == "freed" {
 			go func() {
 				data := map[string]string{
-					"kind":        "parking_alert",
+					"kind":        "parking_spot_freed",
 					"spot_id":     spotID,
 					"spot_number": sn,
-					"title":       "Ваше место занято",
-					"body":        "Место " + sn + " занято посторонним ТС",
+					"title":       "Ваше место освобождено",
+					"body":        "Место " + sn + " снова свободно",
 				}
 				sent, err := s.parkingNotifier.SendToUser(context.Background(), uid, data)
 				if err != nil {
-					log.Printf("[mqtt] parking fcm occupied: %v", err)
+					log.Printf("[mqtt] parking fcm freed: %v", err)
 				} else {
-					log.Printf("[mqtt] parking fcm occupied: user=%s sent=%d spot=%s", uid, sent, sn)
+					log.Printf("[mqtt] parking fcm freed: user=%s sent=%d spot=%s", uid, sent, sn)
 				}
 			}()
 		}
-	} else if msg.EventType == "freed" {
-		go func() {
-			data := map[string]string{
-				"kind":        "parking_spot_freed",
-				"spot_id":     spotID,
-				"spot_number": sn,
-				"title":       "Ваше место освобождено",
-				"body":        "Место " + sn + " снова свободно",
+	}
+
+	// ── Гостевые места ───────────────────────────────────────────────────────
+	if spotType == "guest" && hasActiveGuestPass && guestCarNumber != "" {
+		sn := msg.SpotNumber
+
+		if msg.EventType == "occupied" {
+			// Въезжала ли ожидаемая машина в паркинг недавно?
+			// Учитываем: распознавание номера на parking-gate ИЛИ QR-скан охранником на паркинге
+			var guestEntries int
+			_ = s.db.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM barrier_events
+				WHERE (
+				    (plate_number = $1 AND gate_id = 'parking-gate')
+				    OR
+				    (guest_pass_id = $2 AND event_type = 'QR_SCAN_PARKING')
+				)
+				  AND direction = 'IN'
+				  AND status    = 'OPENED'
+				  AND created_at > NOW() - INTERVAL '30 minutes'
+			`, guestCarNumber, guestPassID).Scan(&guestEntries)
+
+			if guestEntries > 0 {
+				// Это наш гость — помечаем пропуск как использованный
+				_, _ = s.db.Exec(ctx, `UPDATE guest_access SET status = 'used' WHERE id = $1`, guestPassID)
+				log.Printf("[mqtt] parking guest spot=%s: expected car %s arrived — pass marked used", sn, guestCarNumber)
+				return
 			}
-			sent, err := s.parkingNotifier.SendToUser(context.Background(), uid, data)
-			if err != nil {
-				log.Printf("[mqtt] parking fcm freed: %v", err)
-			} else {
-				log.Printf("[mqtt] parking fcm freed: user=%s sent=%d spot=%s", uid, sent, sn)
-			}
-		}()
+
+			// Чужая машина заняла место — уведомляем
+			go func(rID, cn, sn, pID, sID string) {
+				bgCtx := context.Background()
+				userBody := fmt.Sprintf("Гостевое место %s занято чужим автомобилем. Ожидаемый гость (%s) ещё не приехал.", sn, cn)
+				adminBody := fmt.Sprintf("Гостевое место %s занято чужим ТС. Ожидается %s.", sn, cn)
+				jsonData := fmt.Sprintf(`{"spot_id":"%s","spot_number":"%s","expected_car":"%s","pass_id":"%s"}`, sID, sn, cn, pID)
+
+				_, _ = s.db.Exec(bgCtx, `
+					INSERT INTO notifications (target_user_id, kind, title, body, data)
+					VALUES ($1, 'parking_alert', '🚗 Гостевое место занято', $2, $3)`,
+					rID, userBody, jsonData)
+				_, _ = s.db.Exec(bgCtx, `
+					INSERT INTO notifications (target_role, kind, title, body, data)
+					VALUES ('admin', 'parking_alert', '⚠️ Гостевое место занято', $1, $2)`,
+					adminBody, jsonData)
+
+				_, _ = s.parkingNotifier.SendToUser(bgCtx, rID, map[string]string{
+					"kind": "parking_alert", "spot_id": sID, "spot_number": sn,
+					"title": "🚗 Гостевое место занято", "body": userBody,
+				})
+				_, _ = s.parkingNotifier.SendToAdmins(bgCtx, map[string]string{
+					"kind": "parking_alert", "spot_id": sID, "spot_number": sn,
+					"title": "⚠️ Гостевое место занято", "body": adminBody,
+				})
+			}(guestResidentID, guestCarNumber, sn, guestPassID, spotID)
+
+		} else if msg.EventType == "freed" {
+			// Чужая машина уехала, пропуск ещё активен — место осталось reserved, уведомляем
+			go func(rID, cn, sn, pID, sID string) {
+				bgCtx := context.Background()
+				userBody := fmt.Sprintf("Место %s освободилось, но Ваш гость (%s) ещё не приехал. Место остаётся забронированным.", sn, cn)
+				adminBody := fmt.Sprintf("Гостевое место %s освободилось. Пропуск для %s ещё активен — место забронировано.", sn, cn)
+				jsonData := fmt.Sprintf(`{"spot_id":"%s","spot_number":"%s","expected_car":"%s","pass_id":"%s"}`, sID, sn, cn, pID)
+
+				_, _ = s.db.Exec(bgCtx, `
+					INSERT INTO notifications (target_user_id, kind, title, body, data)
+					VALUES ($1, 'parking_spot_freed', '🅿️ Гостевое место освободилось', $2, $3)`,
+					rID, userBody, jsonData)
+				_, _ = s.db.Exec(bgCtx, `
+					INSERT INTO notifications (target_role, kind, title, body, data)
+					VALUES ('admin', 'parking_spot_freed', '🅿️ Гостевое место освободилось', $1, $2)`,
+					adminBody, jsonData)
+
+				_, _ = s.parkingNotifier.SendToUser(bgCtx, rID, map[string]string{
+					"kind": "parking_spot_freed", "spot_id": sID, "spot_number": sn,
+					"title": "🅿️ Гостевое место освободилось", "body": userBody,
+				})
+				_, _ = s.parkingNotifier.SendToAdmins(bgCtx, map[string]string{
+					"kind": "parking_spot_freed", "spot_id": sID, "spot_number": sn,
+					"title": "🅿️ Гостевое место освободилось", "body": adminBody,
+				})
+			}(guestResidentID, guestCarNumber, sn, guestPassID, spotID)
+		}
 	}
 }
 
