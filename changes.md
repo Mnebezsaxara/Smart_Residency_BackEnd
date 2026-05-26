@@ -251,3 +251,46 @@ go run cmd/server/main.go
 
 **Если что-то не работает после мержа** — проверить конфликты в:
 `barrier_v2.go`, `parking_permit.go`, `service_requests.go`.
+
+---
+
+## 7. Изменения от Backend-Claude — 2026-05-27 (после мерджа `094ba13`)
+
+Запрос пришёл от Flutter-Claude (фиксы 2 и 3). После анализа кода + Node-RED flow большая часть фиксов оказалась **уже реализована** — потребовалась только одна правка.
+
+### 7.1. Фикс 2 — `kind = parking_no_permit` вместо `parking_alert` для гостевых мест
+
+`internal/mqtt/client.go`: при сценарии «гостевое место занято чужим ТС, ожидаемый гость ещё не приехал» все 4 точки записи (notification резиденту, notification админу, FCM резиденту, FCM админу) теперь используют `kind = 'parking_no_permit'` (раньше было `parking_alert`).
+
+**Что НЕ менялось:**
+- Для `permanent`-места при «занято посторонним» kind остался `parking_alert` (фронт его уже обрабатывает).
+- Логика обнаружения владельца (через `barrier_events` за 30 минут на `parking-gate`) — без изменений, она и так корректна.
+
+### 7.2. Фикс 3 — никакого изменения кода не потребовалось
+
+Ситуация «владелец встал на permanent-место» уже обрабатывается ([client.go:421-435](internal/mqtt/client.go#L421-L435)): если за последние 30 минут на `parking-gate IN` была машина владельца — push не шлётся.
+
+**Симптом ложных пушей при симуляции через Node-RED — это не баг бэка, а неполная симуляция.** Текущий Node-RED parking flow ([flows_merged.json:931](flows_merged.json#L931)) шлёт только `{spot_number, event_type}` — никакого `car_number` в payload нет (Flutter-Claude в контракте предположил формат, которого не существует). Бэк правильно опирается на `barrier_events`.
+
+**Правильный сценарий симуляции:**
+1. В Node-RED, вкладка `Barrier`, инжект `Manual IN` с номером владельца (например `A777BC`) → топик `smartresidency/barrier/camera/plate`, `gate_id=parking-gate` (внимание: текущий barrier inject шлёт `main-gate`, нужно проверить что для parking-gate есть отдельный inject, иначе доработать flow).
+2. Затем — вкладка `Parking Simulator`, инжект `Permanent spot occupied` с `P-01`.
+3. Бэк увидит recent `barrier_events` для владельца → push НЕ придёт. ✅
+
+**Если в Node-RED нет inject на `parking-gate IN`** — это надо добавить во flow (Egor / Mansur). Альтернатива (если хочется упростить тест) — расширить parking-payload полем `car_number`, тогда бэк будет классифицировать по нему напрямую без зависимости от barrier-flow. Но это уже отдельная задача.
+
+### 7.3. Контракт API между бэком и Flutter — итог
+
+| FCM `kind`            | Когда шлётся                                                          | Цель                                  |
+|-----------------------|-----------------------------------------------------------------------|---------------------------------------|
+| `parking_no_permit`   | Гостевое место `occupied`, есть active-пропуск, гость не приехал      | Резиденту + админу                    |
+| `parking_alert`       | Permanent-место `occupied`, владелец не проезжал через ворота 30 мин  | Резиденту-владельцу                   |
+| `parking_spot_freed`  | Permanent — `freed`; Гостевое — чужак уехал, пропуск ещё активен      | Резиденту (+ админу для гостевого)    |
+
+### 7.4. Чек-лист для Flutter-Claude
+
+- [ ] Создать гостевой пропуск на G-01, **не** сканировать QR.
+- [ ] В Node-RED инжект `Guest spot occupied` G-01 → через 10 сек приходит FCM с `kind=parking_no_permit`, в `notifications_page` красная иконка `Icons.no_meeting_room`.
+- [ ] Сценарий «гость законно приехал»: создать пропуск, отсканировать QR → статус `arrived`. После этого инжект `Guest spot occupied` G-01 — алерт НЕ приходит (логика уже была корректна).
+- [ ] Сценарий «владелец на своём месте»: инжект `Manual IN A777BC` через barrier-flow с `gate_id=parking-gate`, затем `Permanent spot occupied` P-01 (закреплён за владельцем `A777BC`) → push НЕ приходит.
+- [ ] Сценарий «чужак на permanent»: только `Permanent spot occupied` P-01 без предварительного barrier-event → push приходит владельцу с `kind=parking_alert`.

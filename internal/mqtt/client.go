@@ -506,19 +506,19 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 
 				_, _ = s.db.Exec(bgCtx, `
 					INSERT INTO notifications (target_user_id, kind, title, body, data)
-					VALUES ($1, 'parking_alert', '🚗 Гостевое место занято', $2, $3)`,
+					VALUES ($1, 'parking_no_permit', '🚗 Гостевое место занято', $2, $3)`,
 					rID, userBody, jsonData)
 				_, _ = s.db.Exec(bgCtx, `
 					INSERT INTO notifications (target_role, kind, title, body, data)
-					VALUES ('admin', 'parking_alert', '⚠️ Гостевое место занято', $1, $2)`,
+					VALUES ('admin', 'parking_no_permit', '⚠️ Гостевое место занято', $1, $2)`,
 					adminBody, jsonData)
 
 				_, _ = s.parkingNotifier.SendToUser(bgCtx, rID, map[string]string{
-					"kind": "parking_alert", "spot_id": sID, "spot_number": sn,
+					"kind": "parking_no_permit", "spot_id": sID, "spot_number": sn,
 					"title": "🚗 Гостевое место занято", "body": userBody,
 				})
 				_, _ = s.parkingNotifier.SendToAdmins(bgCtx, map[string]string{
-					"kind": "parking_alert", "spot_id": sID, "spot_number": sn,
+					"kind": "parking_no_permit", "spot_id": sID, "spot_number": sn,
 					"title": "⚠️ Гостевое место занято", "body": adminBody,
 				})
 			}(guestResidentID, guestCarNumber, sn, guestPassID, spotID)
