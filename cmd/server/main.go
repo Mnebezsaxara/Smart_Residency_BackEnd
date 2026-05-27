@@ -12,6 +12,7 @@ import (
 	"smartresidency/internal/db"
 	"smartresidency/internal/fcm"
 	"smartresidency/internal/handler"
+	"smartresidency/internal/mail"
 	"smartresidency/internal/middleware"
 	"smartresidency/internal/mqtt"
 	"smartresidency/internal/parking"
@@ -126,15 +127,21 @@ func main() {
 	api := r.Group("/api/v1")
 	secret := os.Getenv("JWT_SECRET")
 
-	authH := handler.NewAuthHandler(pool)
+	mailSender := mail.New()
+	authH := handler.NewAuthHandler(pool, mailSender)
 	api.POST("/auth/register", authH.Register)
 	api.POST("/auth/login", authH.Login)
+	api.POST("/auth/forgot-password", authH.ForgotPassword)
+	api.POST("/auth/reset-password", authH.ResetPassword)
+	// Public endpoint — accepts ONLY the temporary token from Login.
+	api.POST("/auth/change-password-first-login", authH.ChangePasswordFirstLogin)
 
 	priv := api.Group("/")
 	priv.Use(middleware.Auth(secret))
 	{
 		priv.GET("/auth/me", authH.Me)
 		priv.POST("/auth/refresh", authH.Refresh)
+		priv.POST("/auth/change-password", authH.ChangePassword)
 
 		profH := handler.NewProfileHandler(pool)
 		priv.GET("/profiles/:id", profH.Get)
@@ -215,6 +222,12 @@ func main() {
 		priv.POST("/parking/gate/scan-plate", permitH.ScanParkingGate)
 		priv.GET("/admin/parking/permits", permitH.AdminList)
 		priv.PUT("/admin/parking/permits/:id/status", permitH.AdminReview)
+
+		newsH := handler.NewNewsHandler(pool)
+		priv.GET("/news", newsH.List)
+		priv.POST("/admin/news", newsH.Create)
+		priv.PUT("/admin/news/:id", newsH.Update)
+		priv.DELETE("/admin/news/:id", newsH.Delete)
 
 		notifH := handler.NewNotificationsHandler(pool)
 		priv.GET("/notifications", notifH.List)

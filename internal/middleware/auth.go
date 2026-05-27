@@ -13,6 +13,10 @@ type Claims struct {
 	UserID string `json:"user_id"`
 	Email  string `json:"email"`
 	Role   string `json:"role"`
+	// Temp marks a short-lived token issued when an admin-created staff member logs in
+	// with their generated password. The middleware rejects it so the only thing it can
+	// authorize is POST /auth/change-password-first-login (which parses the JWT itself).
+	Temp   bool   `json:"temp,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -38,6 +42,11 @@ func Auth(secret string) gin.HandlerFunc {
 			return
 		}
 		claims := token.Claims.(*Claims)
+		if claims.Temp {
+			log.Printf("[401] temporary token cannot access regular API | path=%s", c.Request.URL.Path)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "password change required"})
+			return
+		}
 		c.Set("user_id", claims.UserID)
 		c.Set("user_role", claims.Role)
 		c.Set("user_email", claims.Email)

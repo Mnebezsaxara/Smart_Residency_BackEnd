@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -11,6 +13,23 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// generateTempPassword returns 8 chars from an unambiguous alphabet
+// (no 0/O/1/l/I) so admins can read it aloud over the phone.
+const tempPasswordAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+
+func generateTempPassword() (string, error) {
+	out := make([]byte, 8)
+	max := big.NewInt(int64(len(tempPasswordAlphabet)))
+	for i := range out {
+		n, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			return "", err
+		}
+		out[i] = tempPasswordAlphabet[n.Int64()]
+	}
+	return string(out), nil
+}
 
 type StaffHandler struct{ db *pgxpool.Pool }
 
@@ -53,14 +72,21 @@ type publicStaffMember struct {
 }
 
 // POST /admin/staff — create a new staff account (admin only).
+// The backend always generates the temporary password itself and returns it
+// in the response so the admin can hand it to the staff member. The staff
+// member is forced to change it on first login (password_change_required flag).
 type createStaffReq struct {
 	FullName     string `json:"full_name"     binding:"required"`
 	Email        string `json:"email"         binding:"required,email"`
-	Password     string `json:"password"      binding:"required,min=6"`
 	Phone        string `json:"phone"         binding:"required"`
 	Specialty    string `json:"specialty"     binding:"required"`
 	WorkSchedule string `json:"work_schedule" binding:"required"`
 	Description  string `json:"description"`
+}
+
+type createStaffResp struct {
+	publicStaffMember
+	TemporaryPassword string `json:"temporary_password"`
 }
 
 func (h *StaffHandler) Create(c *gin.Context) {
@@ -81,7 +107,13 @@ func (h *StaffHandler) Create(c *gin.Context) {
 		return
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	tempPassword, err := generateTempPassword()
+	if err != nil {
+		internalError(c, "Staff.Create/genpass", err)
+		return
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(tempPassword), bcrypt.DefaultCost)
 	if err != nil {
 		internalError(c, "Staff.Create/bcrypt", err)
 		return
@@ -114,8 +146,8 @@ func (h *StaffHandler) Create(c *gin.Context) {
 		INSERT INTO profiles (
 			id, full_name, email, phone,
 			role, specialty, work_schedule, description,
-			verification_status
-		) VALUES ($1, $2, $3, $4, 'staff', $5, $6, $7, 'approved')`,
+			verification_status, password_change_required
+		) VALUES ($1, $2, $3, $4, 'staff', $5, $6, $7, 'approved', TRUE)`,
 		userID, req.FullName, email, req.Phone,
 		specialty, req.WorkSchedule, req.Description,
 	); err != nil {
@@ -128,15 +160,18 @@ func (h *StaffHandler) Create(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, publicStaffMember{
-		ID:           userID,
-		FullName:     req.FullName,
-		Email:        email,
-		Phone:        req.Phone,
-		Specialty:    specialty,
-		WorkSchedule: req.WorkSchedule,
-		Description:  req.Description,
-		IsAvailable:  true,
+	c.JSON(http.StatusCreated, createStaffResp{
+		publicStaffMember: publicStaffMember{
+			ID:           userID,
+			FullName:     req.FullName,
+			Email:        email,
+			Phone:        req.Phone,
+			Specialty:    specialty,
+			WorkSchedule: req.WorkSchedule,
+			Description:  req.Description,
+			IsAvailable:  true,
+		},
+		TemporaryPassword: tempPassword,
 	})
 }
 
