@@ -24,7 +24,7 @@ var specialtyCategories = map[string][]string{
 	"garbage":    {"Вывоз мусора"},
 	"intercom":   {"Домофон"},
 	"elevator":   {"Лифт"},
-	"security":   {"Парковка"},
+	"security":   {"Паркинг"},
 }
 
 // categorySpecialty is the reverse map of specialtyCategories: given a request
@@ -132,7 +132,8 @@ func (h *ServiceRequestHandler) List(c *gin.Context) {
 			return
 		}
 		rows, e := h.db.Query(ctx,
-			srSelect+` WHERE sr.category = ANY($1) ORDER BY sr.created_at DESC`, cats)
+			srSelect+` WHERE sr.category = ANY($1) OR sr.assigned_to = $2
+			           ORDER BY sr.created_at DESC`, cats, userID)
 		if e != nil {
 			internalError(c, "SR.List/staff", e)
 			return
