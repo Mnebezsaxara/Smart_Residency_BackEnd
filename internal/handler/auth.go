@@ -120,18 +120,19 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	ctx := context.Background()
 	var (
-		userID, hash, role string
-		mustChange         bool
+		userID, hash, role, specialty string
+		mustChange                    bool
 	)
 	err := h.db.QueryRow(ctx, `
 		SELECT u.id, u.password_hash,
 		       COALESCE(p.role, 'resident'),
+		       COALESCE(p.specialty, ''),
 		       COALESCE(p.password_change_required, FALSE)
 		FROM users u
 		LEFT JOIN profiles p ON p.id = u.id
 		WHERE u.email = $1`,
 		strings.ToLower(strings.TrimSpace(req.Email)),
-	).Scan(&userID, &hash, &role, &mustChange)
+	).Scan(&userID, &hash, &role, &specialty, &mustChange)
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
@@ -152,9 +153,10 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			"status": "password_change_required",
 			"token":  tempToken,
 			"user": gin.H{
-				"id":    userID,
-				"email": req.Email,
-				"role":  role,
+				"id":        userID,
+				"email":     req.Email,
+				"role":      role,
+				"specialty": specialty,
 			},
 		})
 		return
@@ -166,7 +168,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"token": token, "user_id": userID, "role": role})
+	c.JSON(http.StatusOK, gin.H{"token": token, "user_id": userID, "role": role, "specialty": specialty})
 }
 
 func (h *AuthHandler) Refresh(c *gin.Context) {
