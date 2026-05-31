@@ -12,3 +12,15 @@ desktop.ini
 .idea/
 .vscode/
 .claude/
+
+# Study / defense materials — kept locally, not part of the app
+CODE_KONSPEKT.md
+ZASHITA_KONSPEKT.md
+DEMO_ZASHITA.md
+changes.md
+presentation.md
+fixess.md
+fixes_screenshots/
+
+# Local DB backups
+backup_*.sql

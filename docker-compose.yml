@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: smart_residency
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:${DB_PASSWORD}@db:5432/smart_residency?sslmode=disable
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: "8080"
+      BASE_URL: ${BASE_URL}
+      HIVEMQ_URL: ${HIVEMQ_URL}
+      HIVEMQ_USERNAME: ${HIVEMQ_USERNAME}
+      HIVEMQ_PASSWORD: ${HIVEMQ_PASSWORD}
+      HIVEMQ_CLIENT_ID: ${HIVEMQ_CLIENT_ID}
+      FIREBASE_CREDENTIALS_PATH: /app/firebase-credentials.json
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./firebase-credentials.json:/app/firebase-credentials.json:ro
+      - uploads:/app/uploads
+
+  nodered:
+    image: nodered/node-red:latest
+    restart: unless-stopped
+    ports:
+      - "1880:1880"
+    volumes:
+      - nodered:/data
+
+volumes:
+  pgdata:
+  uploads:
+  nodered:

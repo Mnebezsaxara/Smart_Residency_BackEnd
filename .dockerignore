@@ -1,0 +1,10 @@
+.git
+.env
+.claude/
+*.md
+fixes_screenshots/
+backup_*.sql
+uploads/
+firebase-credentials.json
+*.exe
+flows*.json

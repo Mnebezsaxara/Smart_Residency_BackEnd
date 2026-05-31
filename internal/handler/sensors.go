@@ -63,11 +63,12 @@ type SensorEvent struct {
 	ConfirmedAt    *time.Time `json:"confirmed_at"`
 	CheckingAt     *time.Time `json:"checking_at"`
 	FalseAlarmedAt *time.Time `json:"false_alarmed_at"`
+	ResolvedAt     *time.Time `json:"resolved_at"`
 	ConfirmedBy    *string    `json:"confirmed_by"`
 }
 
 const sensorCols = `id, type, entrance_num, floor, status, last_updated, last_seen_at`
-const eventCols = `id, sensor_id, type, entrance_num, floor, status, threat_type, admin_comment, created_at, confirmed_at, checking_at, false_alarmed_at, confirmed_by`
+const eventCols = `id, sensor_id, type, entrance_num, floor, status, threat_type, admin_comment, created_at, confirmed_at, checking_at, false_alarmed_at, resolved_at, confirmed_by`
 
 func scanSensors(rows pgx.Rows) ([]Sensor, error) {
 	defer rows.Close()
@@ -89,7 +90,7 @@ func scanEvents(rows pgx.Rows) ([]SensorEvent, error) {
 		var e SensorEvent
 		if err := rows.Scan(&e.ID, &e.SensorID, &e.Type, &e.EntranceNum, &e.Floor,
 			&e.Status, &e.ThreatType, &e.AdminComment, &e.CreatedAt, &e.ConfirmedAt,
-			&e.CheckingAt, &e.FalseAlarmedAt, &e.ConfirmedBy); err != nil {
+			&e.CheckingAt, &e.FalseAlarmedAt, &e.ResolvedAt, &e.ConfirmedBy); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -206,7 +207,7 @@ func (h *SensorHandler) UpdateEventStatus(c *gin.Context) {
 	}
 
 	allowedStatus := map[string]bool{
-		"DETECTED": true, "CHECKING": true, "CONFIRMED": true, "FALSE_ALARM": true,
+		"DETECTED": true, "CHECKING": true, "CONFIRMED": true, "FALSE_ALARM": true, "RESOLVED": true,
 	}
 	if !allowedStatus[req.Status] {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid status"})
@@ -243,13 +244,14 @@ func (h *SensorHandler) UpdateEventStatus(c *gin.Context) {
 		    confirmed_at     = CASE WHEN $2 = 'CONFIRMED'   THEN NOW() ELSE confirmed_at     END,
 		    checking_at      = CASE WHEN $2 = 'CHECKING'    AND checking_at      IS NULL THEN NOW() ELSE checking_at      END,
 		    false_alarmed_at = CASE WHEN $2 = 'FALSE_ALARM' AND false_alarmed_at IS NULL THEN NOW() ELSE false_alarmed_at END,
+		    resolved_at      = CASE WHEN $2 = 'RESOLVED'    AND resolved_at      IS NULL THEN NOW() ELSE resolved_at      END,
 		    confirmed_by     = COALESCE($5, confirmed_by)
 		WHERE id = $1
 		RETURNING `+eventCols,
 		id, req.Status, threatPtr, commentPtr, adminPtr,
 	).Scan(&e.ID, &e.SensorID, &e.Type, &e.EntranceNum, &e.Floor,
 		&e.Status, &e.ThreatType, &e.AdminComment, &e.CreatedAt, &e.ConfirmedAt,
-		&e.CheckingAt, &e.FalseAlarmedAt, &e.ConfirmedBy)
+		&e.CheckingAt, &e.FalseAlarmedAt, &e.ResolvedAt, &e.ConfirmedBy)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "event not found"})
@@ -259,7 +261,9 @@ func (h *SensorHandler) UpdateEventStatus(c *gin.Context) {
 		return
 	}
 
-	if req.Status == "FALSE_ALARM" {
+	// Both terminal outcomes clear the physical sensor back to NORMAL:
+	// FALSE_ALARM (it was never real) and RESOLVED (real alarm dealt with).
+	if req.Status == "FALSE_ALARM" || req.Status == "RESOLVED" {
 		_, _ = h.db.Exec(ctx,
 			`UPDATE sensors SET status='NORMAL', last_updated=NOW() WHERE id=$1`, e.SensorID)
 	}
@@ -412,7 +416,7 @@ func (h *SensorHandler) GetEventDetail(c *gin.Context) {
 		`SELECT `+eventCols+` FROM sensor_events WHERE id = $1`, id,
 	).Scan(&e.ID, &e.SensorID, &e.Type, &e.EntranceNum, &e.Floor,
 		&e.Status, &e.ThreatType, &e.AdminComment, &e.CreatedAt, &e.ConfirmedAt,
-		&e.CheckingAt, &e.FalseAlarmedAt, &e.ConfirmedBy)
+		&e.CheckingAt, &e.FalseAlarmedAt, &e.ResolvedAt, &e.ConfirmedBy)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "event not found"})
@@ -470,6 +474,13 @@ func (h *SensorHandler) GetEventDetail(c *gin.Context) {
 		}
 		if e.AdminComment != nil {
 			item["comment"] = *e.AdminComment
+		}
+		timeline = append(timeline, item)
+	}
+	if e.ResolvedAt != nil {
+		item := gin.H{"status": "RESOLVED", "at": *e.ResolvedAt}
+		if e.ConfirmedBy != nil {
+			item["by"] = *e.ConfirmedBy
 		}
 		timeline = append(timeline, item)
 	}
