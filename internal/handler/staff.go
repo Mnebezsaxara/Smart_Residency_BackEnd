@@ -45,6 +45,7 @@ var allowedSpecialties = map[string]bool{
 	"garbage":    true,
 	"intercom":   true,
 	"elevator":   true,
+	"security":   true,
 }
 
 type staffMember struct {
@@ -73,14 +74,18 @@ type publicStaffMember struct {
 
 // POST /admin/staff — create a new staff account (admin only).
 // The backend always generates the temporary password itself and returns it
-// in the response so the admin can hand it to the staff member. The staff
-// member is forced to change it on first login (password_change_required flag).
+// in the response so the admin can hand it to the new account. The account
+// is forced to change the password on first login.
+//
+// Specialty is required and must be one of allowedSpecialties. Security guards
+// are ordinary staff with specialty='security' (the "Охранник" picker maps onto
+// this value).
 type createStaffReq struct {
 	FullName     string `json:"full_name"     binding:"required"`
 	Email        string `json:"email"         binding:"required,email"`
 	Phone        string `json:"phone"         binding:"required"`
 	Specialty    string `json:"specialty"     binding:"required"`
-	WorkSchedule string `json:"work_schedule" binding:"required"`
+	WorkSchedule string `json:"work_schedule"`
 	Description  string `json:"description"`
 }
 
@@ -102,8 +107,8 @@ func (h *StaffHandler) Create(c *gin.Context) {
 	}
 
 	specialty := strings.ToLower(strings.TrimSpace(req.Specialty))
-	if !allowedSpecialties[specialty] {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported specialty"})
+	if specialty == "" || !allowedSpecialties[specialty] {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported or missing specialty for staff"})
 		return
 	}
 
@@ -176,7 +181,8 @@ func (h *StaffHandler) Create(c *gin.Context) {
 }
 
 // GET /staff — public list visible to any authenticated user.
-// Drives the resident "Services" page.
+// Drives the resident "Services" page. Lists all staff with their specialty;
+// security guards appear here as ordinary staff with specialty='security'.
 func (h *StaffHandler) PublicList(c *gin.Context) {
 	rows, err := h.db.Query(context.Background(), `
 		SELECT
@@ -184,10 +190,10 @@ func (h *StaffHandler) PublicList(c *gin.Context) {
 			p.full_name,
 			p.email,
 			p.phone,
-			COALESCE(p.specialty, ''),
+			COALESCE(p.specialty, '')                                     AS specialty,
 			COALESCE(p.work_schedule, ''),
 			COALESCE(p.description, ''),
-			COUNT(sr.id) FILTER (WHERE sr.status = 'in_progress') AS in_progress
+			COUNT(sr.id) FILTER (WHERE sr.status = 'in_progress')         AS in_progress
 		FROM profiles p
 		LEFT JOIN service_requests sr ON sr.assigned_to = p.id
 		WHERE p.role = 'staff'
@@ -231,11 +237,11 @@ func (h *StaffHandler) List(c *gin.Context) {
 			p.full_name,
 			p.email,
 			p.phone,
-			COALESCE(p.specialty, '') AS specialty,
-			COUNT(sr.id) FILTER (WHERE sr.status = 'in_progress')             AS in_progress,
+			COALESCE(p.specialty, '')                                             AS specialty,
+			COUNT(sr.id) FILTER (WHERE sr.status = 'in_progress')                  AS in_progress,
 			COUNT(sr.id) FILTER (WHERE sr.status = 'done'
-			                       AND sr.updated_at >= NOW() - INTERVAL '24h') AS done_today,
-			MAX(sr.taken_at)                                                    AS last_taken_at
+			                       AND sr.updated_at >= NOW() - INTERVAL '24h')    AS done_today,
+			MAX(sr.taken_at)                                                       AS last_taken_at
 		FROM profiles p
 		LEFT JOIN service_requests sr ON sr.assigned_to = p.id
 		WHERE p.role = 'staff'

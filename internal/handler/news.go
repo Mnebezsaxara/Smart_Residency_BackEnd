@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -11,9 +13,20 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type NewsHandler struct{ db *pgxpool.Pool }
+// NewsNotifier pushes FCM messages about freshly posted news to residents.
+// Implemented by *fcm.Sender. nil when push is disabled.
+type NewsNotifier interface {
+	SendToResidents(ctx context.Context, entrance *int, data map[string]string) (int, error)
+}
 
-func NewNewsHandler(db *pgxpool.Pool) *NewsHandler { return &NewsHandler{db: db} }
+type NewsHandler struct {
+	db       *pgxpool.Pool
+	notifier NewsNotifier
+}
+
+func NewNewsHandler(db *pgxpool.Pool, notifier NewsNotifier) *NewsHandler {
+	return &NewsHandler{db: db, notifier: notifier}
+}
 
 type newsItem struct {
 	ID        string    `json:"id"`
@@ -126,7 +139,82 @@ func (h *NewsHandler) Create(c *gin.Context) {
 		`SELECT COALESCE(full_name, '') FROM profiles WHERE id = $1`, authorID,
 	).Scan(&created.Author)
 
+	go h.broadcastNews(context.Background(), id, title, body, created.Entrance)
+
 	c.JSON(http.StatusCreated, created)
+}
+
+// broadcastNews fires push + writes bell rows for every approved resident the
+// news is addressed to. entrance == nil means общая новость (all entrances).
+func (h *NewsHandler) broadcastNews(ctx context.Context, newsID, title, body string, entrance *int) {
+	pushBody := body
+	if len(pushBody) > 120 {
+		pushBody = pushBody[:117] + "..."
+	}
+	data := map[string]string{
+		"kind":    "news_post",
+		"news_id": newsID,
+		"title":   title,
+		"body":    pushBody,
+	}
+
+	// Bell rows: one per resident, scoped by entrance if provided.
+	q := `
+		INSERT INTO notifications (target_user_id, kind, title, body, data)
+		SELECT p.id, 'news_post', $1, $2, $3::jsonb
+		FROM profiles p
+		WHERE p.role = 'resident' AND p.verification_status = 'approved'`
+	args := []any{title, pushBody, `{"news_id":"` + newsID + `"}`}
+	if entrance != nil {
+		q += ` AND p.entrance = $4`
+		args = append(args, *entrance)
+	}
+	tag, err := h.db.Exec(ctx, q, args...)
+	entStr := "ALL"
+	if entrance != nil {
+		entStr = fmt.Sprintf("%d", *entrance)
+	}
+	if err != nil {
+		log.Printf("[news] bell insert: %v", err)
+	} else {
+		log.Printf("[news] broadcast id=%s entrance=%s bell_rows=%d notifier=%v",
+			newsID, entStr, tag.RowsAffected(), h.notifier != nil)
+
+		// Diagnostic: if nobody matched, dump what approved residents we have
+		// and which entrances they belong to.
+		if tag.RowsAffected() == 0 {
+			rows, qErr := h.db.Query(ctx, `
+				SELECT COALESCE(p.full_name,''), p.entrance, p.verification_status, p.role
+				FROM profiles p WHERE p.role = 'resident'`)
+			if qErr == nil {
+				defer rows.Close()
+				var n int
+				for rows.Next() {
+					var name, vs, r string
+					var ent *int
+					if rows.Scan(&name, &ent, &vs, &r) == nil {
+						entRow := "NULL"
+						if ent != nil {
+							entRow = fmt.Sprintf("%d", *ent)
+						}
+						log.Printf("[news]   tenant name=%q role=%s entrance=%s status=%s", name, r, entRow, vs)
+						n++
+					}
+				}
+				log.Printf("[news]   total tenants in db: %d", n)
+			}
+		}
+	}
+
+	if h.notifier == nil {
+		return
+	}
+	sent, err := h.notifier.SendToResidents(ctx, entrance, data)
+	if err != nil {
+		log.Printf("[news] push err: %v", err)
+	} else {
+		log.Printf("[news] push sent=%d", sent)
+	}
 }
 
 type newsUpdateReq struct {

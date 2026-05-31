@@ -198,6 +198,12 @@ func channelIDFor(kind string) string {
 		return "parking_events_v2"
 	case "sensor_alert", "sensor_offline":
 		return "sensor_alerts_v2"
+	case "service_request_new", "service_request_taken",
+		"service_request_assigned", "service_request_done",
+		"service_request_rejected":
+		return "service_requests_v1"
+	case "news_post":
+		return "news_v1"
 	default:
 		return "smart_residency_events"
 	}
@@ -255,6 +261,65 @@ func (s *Sender) SendToAdmins(ctx context.Context, data map[string]string) (int,
 	}
 	if len(tokens) == 0 {
 		log.Printf("[fcm] no admin tokens for kind=%s", data["kind"])
+		return 0, nil
+	}
+	return s.sendMulticast(ctx, tokens, data)
+}
+
+// SendToStaffBySpecialty pushes to every approved staff account with the given
+// specialty. Used when a new service request lands and any free worker of that
+// trade should know about it.
+func (s *Sender) SendToStaffBySpecialty(ctx context.Context, specialty string, data map[string]string) (int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT t.token FROM fcm_tokens t
+		JOIN profiles p ON p.id = t.user_id
+		WHERE p.role = 'staff' AND p.specialty = $1
+		  AND p.verification_status = 'approved'`, specialty)
+	if err != nil {
+		return 0, fmt.Errorf("load staff tokens: %w", err)
+	}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err == nil {
+			tokens = append(tokens, t)
+		}
+	}
+	if len(tokens) == 0 {
+		log.Printf("[fcm] no staff tokens for specialty=%s kind=%s", specialty, data["kind"])
+		return 0, nil
+	}
+	return s.sendMulticast(ctx, tokens, data)
+}
+
+// SendToResidents pushes to every approved resident of the building. If
+// entrance is non-nil, limit to that entrance; otherwise blast all entrances.
+// Used by news posts.
+func (s *Sender) SendToResidents(ctx context.Context, entrance *int, data map[string]string) (int, error) {
+	query := `
+		SELECT t.token FROM fcm_tokens t
+		JOIN profiles p ON p.id = t.user_id
+		WHERE p.role = 'resident' AND p.verification_status = 'approved'`
+	args := []any{}
+	if entrance != nil {
+		query += ` AND p.entrance = $1`
+		args = append(args, *entrance)
+	}
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("load resident tokens: %w", err)
+	}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err == nil {
+			tokens = append(tokens, t)
+		}
+	}
+	if len(tokens) == 0 {
+		log.Printf("[fcm] no resident tokens (entrance=%v) kind=%s", entrance, data["kind"])
 		return 0, nil
 	}
 	return s.sendMulticast(ctx, tokens, data)

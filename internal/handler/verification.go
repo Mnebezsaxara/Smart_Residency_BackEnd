@@ -68,6 +68,11 @@ func (h *VerificationHandler) Submit(c *gin.Context) {
 		return
 	}
 
+	// Self-service registration can only request the resident role. Historical
+	// values (owner/tenant) are normalised to resident; staff and security are
+	// created by an admin via POST /admin/staff, never through verification.
+	req.RequestedRole = "resident"
+
 	userID := c.GetString("user_id")
 	id := uuid.New().String()
 	ctx := context.Background()

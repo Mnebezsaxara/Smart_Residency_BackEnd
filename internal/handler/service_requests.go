@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,12 +24,38 @@ var specialtyCategories = map[string][]string{
 	"garbage":    {"Вывоз мусора"},
 	"intercom":   {"Домофон"},
 	"elevator":   {"Лифт"},
+	"security":   {"Парковка"},
 }
 
-type ServiceRequestHandler struct{ db *pgxpool.Pool }
+// categorySpecialty is the reverse map of specialtyCategories: given a request
+// category, return the staff specialty that handles it. Returns "" for
+// categories no specialty handles.
+var categorySpecialty = func() map[string]string {
+	m := map[string]string{}
+	for sp, cats := range specialtyCategories {
+		for _, c := range cats {
+			m[c] = sp
+		}
+	}
+	return m
+}()
 
-func NewServiceRequestHandler(db *pgxpool.Pool) *ServiceRequestHandler {
-	return &ServiceRequestHandler{db: db}
+// RequestNotifier pushes FCM messages about service-request lifecycle events.
+// Implemented by *fcm.Sender. When nil (e.g., FIREBASE_CREDENTIALS_PATH unset)
+// the bell-notification rows are still written, only the push is skipped.
+type RequestNotifier interface {
+	SendToUser(ctx context.Context, userID string, data map[string]string) (int, error)
+	SendToAdmins(ctx context.Context, data map[string]string) (int, error)
+	SendToStaffBySpecialty(ctx context.Context, specialty string, data map[string]string) (int, error)
+}
+
+type ServiceRequestHandler struct {
+	db       *pgxpool.Pool
+	notifier RequestNotifier
+}
+
+func NewServiceRequestHandler(db *pgxpool.Pool, notifier RequestNotifier) *ServiceRequestHandler {
+	return &ServiceRequestHandler{db: db, notifier: notifier}
 }
 
 type serviceRequest struct {
@@ -138,7 +167,7 @@ type createRequestReq struct {
 
 func (h *ServiceRequestHandler) Create(c *gin.Context) {
 	role := c.GetString("user_role")
-	if role == "staff" || role == "guard" {
+	if role == "staff" {
 		forbiddenAccess(c, "residents only")
 		return
 	}
@@ -149,7 +178,8 @@ func (h *ServiceRequestHandler) Create(c *gin.Context) {
 	}
 	userID := c.GetString("user_id")
 	id := uuid.New().String()
-	_, err := h.db.Exec(context.Background(),
+	ctx := context.Background()
+	_, err := h.db.Exec(ctx,
 		`INSERT INTO service_requests (id, user_id, category, description, status)
 		 VALUES ($1, $2, $3, $4, 'new')`,
 		id, userID, req.Category, req.Description,
@@ -158,13 +188,24 @@ func (h *ServiceRequestHandler) Create(c *gin.Context) {
 		internalError(c, "SR.Create/insert", err)
 		return
 	}
+
+	// Push + bell to admins and to whoever handles this category:
+	// staff with the matching specialty (parking → specialty='security').
+	title := "Новая заявка: " + req.Category
+	body := req.Description
+	if len(body) > 120 {
+		body = body[:117] + "..."
+	}
+	go h.notifyNewRequest(context.Background(), id, req.Category, title, body)
+
 	c.JSON(http.StatusCreated, gin.H{"id": id})
 }
 
-// Take — staff self-assigns an unassigned request in their specialty category.
+// Take — staff self-assigns an unassigned request in their categories.
 // PATCH /service-requests/:id/take
 func (h *ServiceRequestHandler) Take(c *gin.Context) {
-	if c.GetString("user_role") != "staff" {
+	role := c.GetString("user_role")
+	if role != "staff" {
 		forbiddenAccess(c, "staff only")
 		return
 	}
@@ -172,30 +213,47 @@ func (h *ServiceRequestHandler) Take(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	specialty, err := h.staffSpecialty(ctx, userID)
-	if err != nil || specialty == "" {
+	specialty, e := h.staffSpecialty(ctx, userID)
+	if e != nil || specialty == "" {
 		c.JSON(http.StatusForbidden, gin.H{"error": "no specialty assigned to your account"})
 		return
 	}
 	cats := specialtyCategories[specialty]
 
-	tag, err := h.db.Exec(ctx, `
-		UPDATE service_requests
-		SET assigned_to=$1, status='in_progress', taken_at=NOW(), updated_at=NOW()
-		WHERE id=$2
-		  AND category = ANY($3)
-		  AND (assigned_to IS NULL OR assigned_to=$1)
-		  AND status IN ('new','assigned')`,
-		userID, id, cats,
+	var (
+		residentID string
+		category   string
+		staffName  string
 	)
+	err := h.db.QueryRow(ctx, `
+		WITH upd AS (
+			UPDATE service_requests
+			SET assigned_to=$1, status='in_progress', taken_at=NOW(), updated_at=NOW()
+			WHERE id=$2
+			  AND category = ANY($3)
+			  AND (assigned_to IS NULL OR assigned_to=$1)
+			  AND status IN ('new','assigned')
+			RETURNING user_id, category
+		)
+		SELECT upd.user_id, upd.category, COALESCE(p.full_name, '')
+		FROM upd
+		LEFT JOIN profiles p ON p.id=$1`,
+		userID, id, cats,
+	).Scan(&residentID, &category, &staffName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "request not available for your specialty or already taken"})
+		return
+	}
 	if err != nil {
 		internalError(c, "SR.Take/exec", err)
 		return
 	}
-	if tag.RowsAffected() == 0 {
-		c.JSON(http.StatusForbidden, gin.H{"error": "request not available for your specialty or already taken"})
-		return
-	}
+
+	title := "Заявка взята в работу"
+	body := "Сотрудник " + staffName + " взял вашу заявку: " + category
+	go h.notifyResident(context.Background(), residentID, "service_request_taken",
+		title, body, id, category, "in_progress", staffName)
+
 	c.JSON(http.StatusOK, gin.H{"status": "in_progress"})
 }
 
@@ -222,16 +280,44 @@ func (h *ServiceRequestHandler) Assign(c *gin.Context) {
 		return
 	}
 
-	_, err := h.db.Exec(ctx, `
-		UPDATE service_requests
-		SET assigned_to=$1, status='assigned', updated_at=NOW()
-		WHERE id=$2`,
-		body.StaffID, id,
+	var (
+		residentID string
+		category   string
+		staffName  string
 	)
+	err := h.db.QueryRow(ctx, `
+		WITH upd AS (
+			UPDATE service_requests
+			SET assigned_to=$1, status='assigned', updated_at=NOW()
+			WHERE id=$2
+			RETURNING user_id, category
+		)
+		SELECT upd.user_id, upd.category, COALESCE(p.full_name, '')
+		FROM upd
+		LEFT JOIN profiles p ON p.id=$1`,
+		body.StaffID, id,
+	).Scan(&residentID, &category, &staffName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "request not found"})
+		return
+	}
 	if err != nil {
 		internalError(c, "SR.Assign/exec", err)
 		return
 	}
+
+	// Notify resident: an admin assigned a staff member to their request.
+	residentTitle := "На вашу заявку назначен сотрудник"
+	residentBody := staffName + " займётся вашей заявкой: " + category
+	go h.notifyResident(context.Background(), residentID, "service_request_assigned",
+		residentTitle, residentBody, id, category, "assigned", staffName)
+
+	// Notify the assigned staff member directly.
+	staffTitle := "Вам назначена заявка: " + category
+	staffBody := "Откройте раздел заявок, чтобы приступить к работе."
+	go h.notifyStaff(context.Background(), body.StaffID, "service_request_assigned",
+		staffTitle, staffBody, id, category, "assigned")
+
 	c.JSON(http.StatusOK, gin.H{"assigned_to": body.StaffID})
 }
 
@@ -274,18 +360,43 @@ func (h *ServiceRequestHandler) UpdateStatus(c *gin.Context) {
 		if req.Status == "in_progress" {
 			extra = ", taken_at = COALESCE(taken_at, NOW())"
 		}
-		tag, err := h.db.Exec(ctx,
-			`UPDATE service_requests SET status=$1, updated_at=NOW()`+extra+`
-			 WHERE id=$2 AND assigned_to=$3`,
-			req.Status, id, userID,
+		var (
+			residentID string
+			category   string
+			staffName  string
 		)
+		err := h.db.QueryRow(ctx,
+			`WITH upd AS (
+				UPDATE service_requests SET status=$1, updated_at=NOW()`+extra+`
+				WHERE id=$2 AND assigned_to=$3
+				RETURNING user_id, category
+			)
+			SELECT upd.user_id, upd.category, COALESCE(p.full_name, '')
+			FROM upd
+			LEFT JOIN profiles p ON p.id=$3`,
+			req.Status, id, userID,
+		).Scan(&residentID, &category, &staffName)
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "not your request"})
+			return
+		}
 		if err != nil {
 			internalError(c, "SR.UpdateStatus/staff", err)
 			return
 		}
-		if tag.RowsAffected() == 0 {
-			c.JSON(http.StatusForbidden, gin.H{"error": "not your request"})
-			return
+
+		// Push + bell to resident on terminal status changes.
+		switch req.Status {
+		case "done":
+			go h.notifyResident(context.Background(), residentID, "service_request_done",
+				"Заявка выполнена",
+				"Сотрудник "+staffName+" выполнил вашу заявку: "+category,
+				id, category, "done", staffName)
+		case "rejected":
+			go h.notifyResident(context.Background(), residentID, "service_request_rejected",
+				"Заявка отклонена",
+				"Сотрудник "+staffName+" отклонил вашу заявку: "+category,
+				id, category, "rejected", staffName)
 		}
 	} else {
 		forbiddenAccess(c, "admin or staff only")
@@ -421,4 +532,112 @@ func (h *ServiceRequestHandler) attachPhotos(ctx context.Context, requests []ser
 			}
 		}
 	}
+}
+
+// requestDataJSON serializes the common payload that Flutter uses to open the
+// right request screen on notification tap.
+func requestDataJSON(requestID, category, status, assignedName string) string {
+	return fmt.Sprintf(
+		`{"request_id":"%s","category":%q,"status":"%s","assigned_to_name":%q}`,
+		requestID, category, status, assignedName,
+	)
+}
+
+// notifyNewRequest fires when a resident creates a request: bell + push to
+// all admins and to whoever handles this category — staff with the matching
+// specialty (parking goes to specialty='security').
+func (h *ServiceRequestHandler) notifyNewRequest(ctx context.Context, requestID, category, title, body string) {
+	data := requestDataJSON(requestID, category, "new", "")
+	specialty := categorySpecialty[category]
+
+	if _, err := h.db.Exec(ctx, `
+		INSERT INTO notifications (target_role, kind, title, body, data)
+		VALUES ('admin', 'service_request_new', $1, $2, $3::jsonb)`,
+		title, body, data,
+	); err != nil {
+		log.Printf("[sr] new admin bell: %v", err)
+	}
+
+	if specialty != "" {
+		if _, err := h.db.Exec(ctx, `
+			INSERT INTO notifications (target_user_id, kind, title, body, data)
+			SELECT p.id, 'service_request_new', $1, $2, $3::jsonb
+			FROM profiles p
+			WHERE p.role = 'staff' AND p.specialty = $4`,
+			title, body, data, specialty,
+		); err != nil {
+			log.Printf("[sr] new staff bell: %v", err)
+		}
+	}
+
+	if h.notifier == nil {
+		return
+	}
+	push := map[string]string{
+		"kind":       "service_request_new",
+		"request_id": requestID,
+		"category":   category,
+		"status":     "new",
+		"title":      title,
+		"body":       body,
+	}
+	_, _ = h.notifier.SendToAdmins(ctx, push)
+	if specialty != "" {
+		_, _ = h.notifier.SendToStaffBySpecialty(ctx, specialty, push)
+	}
+}
+
+// notifyResident sends bell + push to one resident about a status change on
+// their request (taken / assigned / done / rejected).
+func (h *ServiceRequestHandler) notifyResident(ctx context.Context, residentID, kind, title, body, requestID, category, status, assignedName string) {
+	if residentID == "" {
+		return
+	}
+	data := requestDataJSON(requestID, category, status, assignedName)
+	if _, err := h.db.Exec(ctx, `
+		INSERT INTO notifications (target_user_id, kind, title, body, data)
+		VALUES ($1, $2, $3, $4, $5::jsonb)`,
+		residentID, kind, title, body, data,
+	); err != nil {
+		log.Printf("[sr] resident bell %s: %v", kind, err)
+	}
+	if h.notifier == nil {
+		return
+	}
+	_, _ = h.notifier.SendToUser(ctx, residentID, map[string]string{
+		"kind":             kind,
+		"request_id":       requestID,
+		"category":         category,
+		"status":           status,
+		"assigned_to_name": assignedName,
+		"title":            title,
+		"body":             body,
+	})
+}
+
+// notifyStaff sends bell + push to one staff member (used when admin assigns
+// a request directly to a specific worker).
+func (h *ServiceRequestHandler) notifyStaff(ctx context.Context, staffID, kind, title, body, requestID, category, status string) {
+	if staffID == "" {
+		return
+	}
+	data := requestDataJSON(requestID, category, status, "")
+	if _, err := h.db.Exec(ctx, `
+		INSERT INTO notifications (target_user_id, kind, title, body, data)
+		VALUES ($1, $2, $3, $4, $5::jsonb)`,
+		staffID, kind, title, body, data,
+	); err != nil {
+		log.Printf("[sr] staff bell %s: %v", kind, err)
+	}
+	if h.notifier == nil {
+		return
+	}
+	_, _ = h.notifier.SendToUser(ctx, staffID, map[string]string{
+		"kind":       kind,
+		"request_id": requestID,
+		"category":   category,
+		"status":     status,
+		"title":      title,
+		"body":       body,
+	})
 }

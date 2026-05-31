@@ -52,6 +52,8 @@ func main() {
 	var offlineNotifier sensors.OfflineNotifier
 	var barrierNotifier handler.BarrierNotifier
 	var parkingNotifier mqtt.ParkingNotifier
+	var requestNotifier handler.RequestNotifier
+	var newsNotifier handler.NewsNotifier
 	if credPath := os.Getenv("FIREBASE_CREDENTIALS_PATH"); credPath != "" {
 		s, err := fcm.New(ctx, credPath, pool)
 		if err != nil {
@@ -62,6 +64,8 @@ func main() {
 			offlineNotifier = s
 			barrierNotifier = s
 			parkingNotifier = s
+			requestNotifier = s
+			newsNotifier = s
 			log.Println("fcm initialized")
 		}
 	} else {
@@ -147,7 +151,7 @@ func main() {
 		priv.GET("/profiles/:id", profH.Get)
 		priv.PUT("/profiles/:id", profH.Update)
 
-		srH := handler.NewServiceRequestHandler(pool)
+		srH := handler.NewServiceRequestHandler(pool, requestNotifier)
 		priv.GET("/service-requests", srH.List)
 		priv.POST("/service-requests", srH.Create)
 		priv.PUT("/service-requests/:id", srH.UpdateStatus)
@@ -223,7 +227,7 @@ func main() {
 		priv.GET("/admin/parking/permits", permitH.AdminList)
 		priv.PUT("/admin/parking/permits/:id/status", permitH.AdminReview)
 
-		newsH := handler.NewNewsHandler(pool)
+		newsH := handler.NewNewsHandler(pool, newsNotifier)
 		priv.GET("/news", newsH.List)
 		priv.POST("/admin/news", newsH.Create)
 		priv.PUT("/admin/news/:id", newsH.Update)

@@ -14,6 +14,24 @@ type BarrierHandler struct{ db *pgxpool.Pool }
 
 func NewBarrierHandler(db *pgxpool.Pool) *BarrierHandler { return &BarrierHandler{db: db} }
 
+// isBarrierStaff reports whether the caller may use security/barrier endpoints:
+// admins, or staff whose specialty is 'security' (formerly the standalone
+// 'guard' role, collapsed into staff with specialty='security' in migration 017).
+func isBarrierStaff(c *gin.Context, db *pgxpool.Pool) bool {
+	switch c.GetString("user_role") {
+	case "admin":
+		return true
+	case "staff":
+		var specialty string
+		err := db.QueryRow(context.Background(),
+			`SELECT COALESCE(specialty, '') FROM profiles WHERE id = $1`,
+			c.GetString("user_id")).Scan(&specialty)
+		return err == nil && specialty == "security"
+	default:
+		return false
+	}
+}
+
 type barrierLog struct {
 	ID         string    `json:"id"`
 	UserID     *string   `json:"user_id"`
@@ -39,7 +57,6 @@ func (h *BarrierHandler) OpenBarrier(c *gin.Context) {
 }
 
 func (h *BarrierHandler) List(c *gin.Context) {
-	role := c.GetString("user_role")
 	userID := c.GetString("user_id")
 	ctx := context.Background()
 
@@ -51,7 +68,7 @@ func (h *BarrierHandler) List(c *gin.Context) {
 	}
 	var err error
 
-	if role == "admin" || role == "guard" {
+	if isBarrierStaff(c, h.db) {
 		rows, err = h.db.Query(ctx,
 			`SELECT id, user_id, access_type, direction, car_number, notes, created_at
 			 FROM barrier_logs ORDER BY created_at DESC LIMIT 200`)
