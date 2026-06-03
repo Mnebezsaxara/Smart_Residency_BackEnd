@@ -11,12 +11,19 @@
 package mail
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/smtp"
 	"os"
 	"strings"
+	"time"
 )
+
+// dialTimeout bounds the TCP connect to the SMTP server so a firewalled egress
+// port fails fast instead of hanging for the OS default.
+const dialTimeout = 10 * time.Second
 
 type Sender struct {
 	host string
@@ -71,9 +78,49 @@ func (s *Sender) SendCode(to, code string) error {
 	addr := s.host + ":" + s.port
 	auth := smtp.PlainAuth("", s.user, s.pass, s.host)
 
-	if err := smtp.SendMail(addr, auth, s.from, []string{to}, []byte(msg)); err != nil {
-		return fmt.Errorf("smtp send: %w", err)
+	// net/smtp.SendMail dials without any timeout: if the host's egress SMTP
+	// port is firewalled (e.g. DigitalOcean blocks outbound 25/587 on new
+	// droplets) the TCP connect hangs for the OS default — minutes. We dial
+	// manually with a bounded timeout so a blocked port fails fast and loudly
+	// instead of leaking a goroutine.
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		return fmt.Errorf("smtp dial %s: %w", addr, err)
 	}
+
+	client, err := smtp.NewClient(conn, s.host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp client: %w", err)
+	}
+	defer client.Close()
+
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err := client.StartTLS(&tls.Config{ServerName: s.host}); err != nil {
+			return fmt.Errorf("smtp starttls: %w", err)
+		}
+	}
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("smtp auth: %w", err)
+	}
+	if err := client.Mail(s.from); err != nil {
+		return fmt.Errorf("smtp mail from: %w", err)
+	}
+	if err := client.Rcpt(to); err != nil {
+		return fmt.Errorf("smtp rcpt to: %w", err)
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("smtp data: %w", err)
+	}
+	if _, err := w.Write([]byte(msg)); err != nil {
+		return fmt.Errorf("smtp write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("smtp data close: %w", err)
+	}
+	_ = client.Quit()
+
 	log.Printf("[mail] reset code sent to %s", to)
 	return nil
 }

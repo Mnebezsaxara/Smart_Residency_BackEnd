@@ -379,12 +379,17 @@ func (h *AuthHandler) ForgotPassword(c *gin.Context) {
 	}
 
 	if h.mail != nil {
-		if err := h.mail.SendCode(email, code); err != nil {
-			// Log the error but still return 200 — we already saved the code, the
-			// user can retry, and we don't want to leak whether SMTP failed vs.
-			// whether the email was unknown.
-			log.Printf("[mail] send reset code to %s: %v", email, err)
-		}
+		// Send in the background so the HTTP response returns immediately. SMTP
+		// (TLS handshake to Gmail, or a hostile network that silently drops the
+		// connection) can take many seconds; doing it inline made the client wait
+		// on it and time out, surfacing a false "ошибка отправки кода" even though
+		// the code was already saved. We log delivery errors but never block on or
+		// leak them — the user can always retry.
+		go func() {
+			if err := h.mail.SendCode(email, code); err != nil {
+				log.Printf("[mail] send reset code to %s: %v", email, err)
+			}
+		}()
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "if the email is registered, a code was sent"})
