@@ -25,7 +25,12 @@ type ParkingSpot struct {
 	Status         string    `json:"status"`
 	AssignedUserID *string   `json:"assigned_user_id"`
 	IsMine         bool      `json:"is_mine"`
-	CreatedAt      time.Time `json:"created_at"`
+	// Alert is true only when the spot is occupied by a STRANGER (the backend
+	// confirmed no owner/expected-guest entry). Flutter shows the red "занято
+	// посторонним ТС" + "Сообщить администратору" view based on this, NOT on
+	// status == occupied. Set by the MQTT parking handler (see handleParking).
+	Alert     bool      `json:"alert"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type ParkingSpotAdmin struct {
@@ -61,7 +66,7 @@ type ParkingEvent struct {
 func (h *ParkingHandler) ListSpots(c *gin.Context) {
 	userID := c.GetString("user_id")
 	rows, err := h.db.Query(c.Request.Context(), `
-		SELECT id, spot_number, type, status, assigned_user_id, created_at
+		SELECT id, spot_number, type, status, assigned_user_id, alert, created_at
 		FROM parking_spots
 		ORDER BY type DESC, spot_number ASC`)
 	if err != nil {
@@ -72,7 +77,7 @@ func (h *ParkingHandler) ListSpots(c *gin.Context) {
 	out := []ParkingSpot{}
 	for rows.Next() {
 		var s ParkingSpot
-		if err := rows.Scan(&s.ID, &s.SpotNumber, &s.Type, &s.Status, &s.AssignedUserID, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.SpotNumber, &s.Type, &s.Status, &s.AssignedUserID, &s.Alert, &s.CreatedAt); err != nil {
 			internalError(c, "Parking.ListSpots/scan", err)
 			return
 		}

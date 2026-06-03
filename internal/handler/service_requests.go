@@ -24,7 +24,11 @@ var specialtyCategories = map[string][]string{
 	"garbage":    {"Вывоз мусора"},
 	"intercom":   {"Домофон"},
 	"elevator":   {"Лифт"},
-	"security":   {"Паркинг"},
+	// Канонная категория парковочных жалоб — «Паркинг» (фикс e5ae60f). «Парковка»
+	// принимаем как синоним, чтобы жалобы доходили до охраны независимо от того,
+	// какое из написаний прислал клиент, и чтобы старые строки «Парковка» в БД тоже
+	// маршрутизировались верно.
+	"security": {"Паркинг", "Парковка"},
 }
 
 // categorySpecialty is the reverse map of specialtyCategories: given a request
@@ -93,12 +97,20 @@ func scanSRRows(rows interface {
 			&r.AssignedTo, &r.AssignedToName, &r.TakenAt,
 			&r.CreatedAt, &r.UpdatedAt,
 		); err != nil {
-			return nil, err
+			// One malformed row must not take down the whole requests screen with
+			// a 500. Log it (so we can find the bad row) and keep the good ones.
+			// A failed Scan can leave the pgx result stream unusable, so stop here
+			// and return what we already collected.
+			log.Printf("[sr] scan row skipped: %v", err)
+			break
 		}
 		r.Photos = []string{}
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		log.Printf("[sr] list rows iteration: %v", err)
+	}
+	return out, nil
 }
 
 func (h *ServiceRequestHandler) List(c *gin.Context) {

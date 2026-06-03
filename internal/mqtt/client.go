@@ -400,8 +400,54 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 		newStatus = "reserved"
 	}
 
+	// alert — занято ли место ПОСТОРОННИМ ТС (для тревожного вида в приложении).
+	// Решает сервер, а не Flutter по status==occupied:
+	//   • постоянное место занято, а владелец недавно НЕ въезжал в паркинг → чужой;
+	//   • гостевое место занято, а ожидаемый гость ещё не приехал → чужой.
+	// Счётчики ownerEntries/guestEntries считаем здесь, в основном потоке, чтобы и
+	// статус места, и FCM-уведомления ниже опирались на одно решение, и чтобы alert
+	// проставлялся даже когда FCM выключен (s.parkingNotifier == nil).
+	alert := false
+	ownerEntries := 0
+	guestEntries := 0
+	if msg.EventType == "occupied" {
+		if spotType == "permanent" && assignedUserID != nil {
+			_ = s.db.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM barrier_events be
+				JOIN vehicles v ON v.id = be.vehicle_id
+				WHERE v.user_id    = $1
+				  AND be.direction = 'IN'
+				  AND be.status    = 'OPENED'
+				  AND be.gate_id   = 'parking-gate'
+				  AND be.created_at > NOW() - INTERVAL '30 minutes'
+			`, *assignedUserID).Scan(&ownerEntries)
+			alert = ownerEntries == 0
+		} else if spotType == "guest" && hasActiveGuestPass && guestCarNumber != "" {
+			_ = s.db.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM barrier_events
+				WHERE (
+				    (plate_number = $1 AND gate_id = 'parking-gate')
+				    OR
+				    (guest_pass_id = $2 AND event_type = 'QR_SCAN_PARKING')
+				)
+				  AND direction = 'IN'
+				  AND status    = 'OPENED'
+				  AND created_at > NOW() - INTERVAL '30 minutes'
+			`, guestCarNumber, guestPassID).Scan(&guestEntries)
+			if guestEntries > 0 {
+				// Это наш гость — помечаем пропуск как использованный.
+				_, _ = s.db.Exec(ctx, `UPDATE guest_access SET status = 'used' WHERE id = $1`, guestPassID)
+				log.Printf("[mqtt] parking guest spot=%s: expected car %s arrived — pass marked used", msg.SpotNumber, guestCarNumber)
+			} else {
+				alert = true
+			}
+		}
+	}
+
 	if _, err := s.db.Exec(ctx,
-		`UPDATE parking_spots SET status = $1 WHERE id = $2`, newStatus, spotID); err != nil {
+		`UPDATE parking_spots SET status = $1, alert = $2 WHERE id = $3`, newStatus, alert, spotID); err != nil {
 		log.Printf("[mqtt] parking update spot %s: %v", msg.SpotNumber, err)
 	}
 	if _, err := s.db.Exec(ctx,
@@ -418,18 +464,6 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 		uid := *assignedUserID
 		sn := msg.SpotNumber
 		if msg.EventType == "occupied" {
-			var ownerEntries int
-			_ = s.db.QueryRow(ctx, `
-				SELECT COUNT(*)
-				FROM barrier_events be
-				JOIN vehicles v ON v.id = be.vehicle_id
-				WHERE v.user_id    = $1
-				  AND be.direction = 'IN'
-				  AND be.status    = 'OPENED'
-				  AND be.gate_id   = 'parking-gate'
-				  AND be.created_at > NOW() - INTERVAL '30 minutes'
-			`, uid).Scan(&ownerEntries)
-
 			if ownerEntries > 0 {
 				log.Printf("[mqtt] parking spot=%s occupied: owner vehicle entered recently (%d event(s)) — skip fcm",
 					sn, ownerEntries)
@@ -474,26 +508,8 @@ func (s *Subscriber) handleParking(_ paho.Client, m paho.Message) {
 		sn := msg.SpotNumber
 
 		if msg.EventType == "occupied" {
-			// Въезжала ли ожидаемая машина в паркинг недавно?
-			// Учитываем: распознавание номера на parking-gate ИЛИ QR-скан охранником на паркинге
-			var guestEntries int
-			_ = s.db.QueryRow(ctx, `
-				SELECT COUNT(*)
-				FROM barrier_events
-				WHERE (
-				    (plate_number = $1 AND gate_id = 'parking-gate')
-				    OR
-				    (guest_pass_id = $2 AND event_type = 'QR_SCAN_PARKING')
-				)
-				  AND direction = 'IN'
-				  AND status    = 'OPENED'
-				  AND created_at > NOW() - INTERVAL '30 minutes'
-			`, guestCarNumber, guestPassID).Scan(&guestEntries)
-
 			if guestEntries > 0 {
-				// Это наш гость — помечаем пропуск как использованный
-				_, _ = s.db.Exec(ctx, `UPDATE guest_access SET status = 'used' WHERE id = $1`, guestPassID)
-				log.Printf("[mqtt] parking guest spot=%s: expected car %s arrived — pass marked used", sn, guestCarNumber)
+				// Ожидаемый гость заехал — пропуск уже помечен used выше, FCM не шлём.
 				return
 			}
 
