@@ -490,7 +490,7 @@ func (h *ServiceRequestHandler) ResolveAppeal(c *gin.Context) {
 			return
 		}
 		if _, err := h.db.Exec(ctx,
-			`UPDATE parking_permits SET status='approved', updated_at=NOW() WHERE id=$1`, permitID,
+			`UPDATE parking_permits SET status='approved', reviewed_at=NOW() WHERE id=$1`, permitID,
 		); err != nil {
 			internalError(c, "SR.ResolveAppeal/approve_permit", err)
 			return
