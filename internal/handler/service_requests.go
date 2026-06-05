@@ -480,20 +480,33 @@ func (h *ServiceRequestHandler) ResolveAppeal(c *gin.Context) {
 	}
 
 	if body.Approved {
+		// Одобряем последний отклонённый пропуск жителя одним апдейтом:
+		//   • status -> approved;
+		//   • admin_comment -> NULL: стираем комментарий прошлого отклонения
+		//     («неправильный док»), иначе он остаётся висеть на одобренной карточке;
+		//   • забираем spot_id, чтобы дальше привязать место к владельцу.
 		var permitID string
+		var spotID *string
 		if err := h.db.QueryRow(ctx,
-			`SELECT id FROM parking_permits
-			 WHERE user_id=$1 AND status='rejected'
-			 ORDER BY created_at DESC LIMIT 1`, userID,
-		).Scan(&permitID); err != nil {
+			`UPDATE parking_permits
+			    SET status='approved', admin_comment=NULL, reviewed_at=NOW()
+			  WHERE id = (
+			      SELECT id FROM parking_permits
+			       WHERE user_id=$1 AND status='rejected'
+			       ORDER BY created_at DESC LIMIT 1
+			  )
+			  RETURNING id, spot_id`, userID,
+		).Scan(&permitID, &spotID); err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "no rejected permit found for user"})
 			return
 		}
-		if _, err := h.db.Exec(ctx,
-			`UPDATE parking_permits SET status='approved', reviewed_at=NOW() WHERE id=$1`, permitID,
-		); err != nil {
-			internalError(c, "SR.ResolveAppeal/approve_permit", err)
-			return
+		// Привязываем место к владельцу — ровно как обычное одобрение (AdminReview),
+		// чтобы handleParking распознавал «своего» и поднимал alert при занятости
+		// места посторонним ТС. Без этого одобренный через апелляцию пропуск не
+		// реагировал бы на чужака, в отличие от обычно одобренного.
+		if spotID != nil {
+			_, _ = h.db.Exec(ctx,
+				`UPDATE parking_spots SET assigned_user_id=$1 WHERE id=$2`, userID, *spotID)
 		}
 		if _, err := h.db.Exec(ctx,
 			`UPDATE profiles SET parking_permit_status='approved', updated_at=NOW() WHERE id=$1`, userID,
