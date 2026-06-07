@@ -480,11 +480,15 @@ func (h *ServiceRequestHandler) ResolveAppeal(c *gin.Context) {
 	}
 
 	if body.Approved {
-		// Одобряем последний отклонённый пропуск жителя одним апдейтом:
+		// Одобряем отклонённый пропуск жителя одним апдейтом:
 		//   • status -> approved;
 		//   • admin_comment -> NULL: стираем комментарий прошлого отклонения
 		//     («неправильный док»), иначе он остаётся висеть на одобренной карточке;
 		//   • забираем spot_id, чтобы дальше привязать место к владельцу.
+		// Выбираем пропуск с НЕпустым местом в приоритете (`spot_id IS NOT NULL`
+		// сначала), и лишь затем — самый свежий. Иначе, если последняя попытка
+		// была подана без выбора места, апелляция одобрила бы пропуск без spot_id
+		// → место не привязалось бы → не было бы карточки «Моё место» и alert.
 		var permitID string
 		var spotID *string
 		if err := h.db.QueryRow(ctx,
@@ -493,7 +497,8 @@ func (h *ServiceRequestHandler) ResolveAppeal(c *gin.Context) {
 			  WHERE id = (
 			      SELECT id FROM parking_permits
 			       WHERE user_id=$1 AND status='rejected'
-			       ORDER BY created_at DESC LIMIT 1
+			       ORDER BY (spot_id IS NOT NULL) DESC, created_at DESC
+			       LIMIT 1
 			  )
 			  RETURNING id, spot_id`, userID,
 		).Scan(&permitID, &spotID); err != nil {
