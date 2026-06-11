@@ -36,7 +36,7 @@ func NewOfflineSweeper(db *pgxpool.Pool, notifier OfflineNotifier, bcast Broadca
 		db:           db,
 		notifier:     notifier,
 		bcast:        bcast,
-		OfflineAfter: 60 * time.Second,
+		OfflineAfter: 180 * time.Second,
 		Interval:     15 * time.Second,
 	}
 }
